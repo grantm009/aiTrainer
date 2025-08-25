@@ -12,6 +12,7 @@ class Event {
   final int handBrakeStatus;
   final int doorStatus;
   final int ignitionStatus;
+  final String note;
 
   Event({
     required this.ts,
@@ -19,6 +20,7 @@ class Event {
     required this.handBrakeStatus,
     required this.doorStatus,
     required this.ignitionStatus,
+    required this.note,
   });
 
   Map<String, dynamic> toJson() => {
@@ -73,31 +75,127 @@ class _UiState {
   String? connectedDevice;
   String? connectedMac;
   int? currentRssi;
+  Timer? _rssiTimer;
 
   bool isTraining = false;
   String? selectedTag;
   DateTime? trainingStartReal;
+  double _tsCursor = 0.0;
+  Timer? _streamTimer;
   final List<Event> buffer = [];
+
   final List<TrainingSession> history = [];
+
   final List<String> _snack = [];
+
+  bool _seeded = false;
+
+  void seedHistoryIfNeeded() {
+    if (_seeded) return;
+    _seeded = true;
+    final now = DateTime.now();
+    final rand = Random();
+    for (int i = 0; i < 6; i++) {
+      final device = "BWD-V${300 + rand.nextInt(80)}";
+      final mac = _fakeMac(rand);
+      final tag = _tags[rand.nextInt(_tags.length)];
+      final started =
+      now.subtract(Duration(days: rand.nextInt(7) + 1, minutes: rand.nextInt(160)));
+      final events = _fakeEvents(rand, count: 120 + rand.nextInt(80));
+      final ended = started.add(Duration(milliseconds: (events.last.ts * 1000).round()));
+      history.add(TrainingSession(
+        id: "HIST-${now.millisecondsSinceEpoch}-$i",
+        tag: tag,
+        device: "$device ($mac)",
+        startedAt: started,
+        endedAt: ended,
+        events: events,
+      ));
+    }
+    history.sort((a, b) => b.endedAt.compareTo(a.endedAt));
+  }
+
+  void startRssiTicker() {
+    _rssiTimer?.cancel();
+    if (connectedDevice == null) return;
+    final rand = Random();
+    currentRssi = -55;
+    _rssiTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final jitter = rand.nextInt(5) - 2;
+      currentRssi = (((currentRssi ?? -55) + jitter).clamp(-65, -40)).toInt();
+    });
+  }
+
+  void stopRssiTicker() {
+    _rssiTimer?.cancel();
+    _rssiTimer = null;
+    currentRssi = null;
+  }
 
   void enqueueSnack(String m) => _snack.add(m);
   String? takeSnack() => _snack.isEmpty ? null : _snack.removeAt(0);
 
   void dispose() {
-    // Clean up any active connections or streams here
+    _rssiTimer?.cancel();
+    _streamTimer?.cancel();
   }
 
   void startTraining() {
     isTraining = true;
     buffer.clear();
     trainingStartReal = DateTime.now();
-    // In a real implementation, this is where you would subscribe
-    // to the BLE characteristic for live data streaming.
+    _tsCursor = 0.0;
+
+    final rand = Random();
+    _streamTimer?.cancel();
+
+    void tick() {
+      if (!isTraining) return;
+      final gapMs = 400 + rand.nextInt(300);
+      _streamTimer = Timer(Duration(milliseconds: gapMs), () {
+        if (!isTraining) return;
+        _tsCursor += gapMs / 1000.0;
+        final last = buffer.isEmpty ? (currentRssi ?? -58) : buffer.last.rssi;
+        final drift = rand.nextInt(5) - 2;
+        final rssi = ((last + drift).clamp(-80, -35)).toInt();
+
+        final hb = rand.nextInt(100) < 70 ? 1 : 0;
+        final door = rand.nextInt(100) < 15 ? 1 : 0;
+        int ign;
+        switch (selectedTag) {
+          case "approach":
+          case "baseline":
+            ign = rand.nextInt(100) < 10 ? 1 : 0;
+            break;
+          case "enter":
+          case "leave":
+          case "depart":
+            ign = rand.nextInt(100) < 45 ? 1 : 0;
+            break;
+          default:
+            ign = 0;
+        }
+
+        buffer.add(Event(
+          ts: double.parse(_tsCursor.toStringAsFixed(1)),
+          rssi: rssi,
+          handBrakeStatus: hb,
+          doorStatus: door,
+          ignitionStatus: ign,
+          note: "pkt#${buffer.length + 1}",
+        ));
+
+        tick();
+      });
+    }
+
+    tick();
   }
 
   TrainingSession endTrainingAndBuildSession() {
     isTraining = false;
+    _streamTimer?.cancel();
+    _streamTimer = null;
     final started = trainingStartReal ?? DateTime.now();
     final ended =
     started.add(Duration(milliseconds: buffer.isEmpty ? 0 : (buffer.last.ts * 1000).round()));
@@ -113,6 +211,8 @@ class _UiState {
 
   void discardTraining() {
     isTraining = false;
+    _streamTimer?.cancel();
+    _streamTimer = null;
     buffer.clear();
   }
 }
@@ -120,6 +220,31 @@ class _UiState {
 const _tags = ["approach", "enter", "leave", "depart", "baseline"];
 const kCardRadius = 12.0;
 const kCardElevation = 4.0;
+
+String _fakeMac(Random r) {
+  String two() => r.nextInt(256).toRadixString(16).padLeft(2, '0').toUpperCase();
+  return "D1:9A:${two()}:${two()}:${two()}:${two()}";
+}
+
+List<Event> _fakeEvents(Random r, {int count = 150}) {
+  final out = <Event>[];
+  double ts = 0.0;
+  int rssi = -60 + r.nextInt(8);
+  for (int i = 0; i < count; i++) {
+    final gap = 400 + r.nextInt(300);
+    ts += gap / 1000.0;
+    rssi = ((rssi + (r.nextInt(5) - 2)).clamp(-80, -35)).toInt();
+    out.add(Event(
+        ts: double.parse(ts.toStringAsFixed(1)),
+        rssi: rssi,
+        handBrakeStatus: r.nextInt(100) < 70 ? 1 : 0,
+        doorStatus: r.nextInt(100) < 15 ? 1 : 0,
+        ignitionStatus: r.nextInt(100) < 35 ? 1 : 0,
+        note: "pkt#${i + 1}"),
+    );
+  }
+  return out;
+}
 
 const int _RSSI_GOOD = -50;
 const int _RSSI_OK = -70;
@@ -178,7 +303,7 @@ class _TagSelector extends StatelessWidget {
   final ValueChanged<String> onSelected;
   final bool enabled;
 
-  const _TagSelector({super.key, required this.selected, required this.onSelected, required this.enabled});
+  const _TagSelector({required this.selected, required this.onSelected, required this.enabled});
 
   @override
   Widget build(BuildContext context) {
@@ -208,23 +333,68 @@ class _TagSelector extends StatelessWidget {
   }
 }
 
-class _LiveEventList extends StatelessWidget {
+class _LiveEventList extends StatefulWidget {
   final _UiState state;
   final VoidCallback notify;
 
-  const _LiveEventList({super.key, required this.state, required this.notify});
+  const _LiveEventList({required this.state, required this.notify});
+
+  @override
+  _LiveEventListState createState() => _LiveEventListState();
+}
+
+class _LiveEventListState extends State<_LiveEventList> {
+  Timer? _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulse = Timer.periodic(const Duration(milliseconds: 100), (_) {
+      if (!mounted) return;
+      if (widget.state.isTraining) {
+        setState(() {});
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _pulse?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final s = state;
+    final s = widget.state;
     if (s.buffer.isEmpty) {
       return const Center(
-          child: Text("Waiting for data stream...", style: TextStyle(fontStyle: FontStyle.italic)));
+          child: Text("Initializing stream...", style: TextStyle(fontStyle: FontStyle.italic)));
     }
     return ListView.builder(
       reverse: true,
       padding: EdgeInsets.zero,
       physics: const BouncingScrollPhysics(),
+      prototypeItem: const Column(
+        children: [
+          Padding(
+            padding: EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            child: Row(
+              children: [
+                Expanded(child: Text("ts: 00.00s", style: TextStyle(fontSize: 13))),
+                Text("RSSI: -00 dBm", style: TextStyle(fontSize: 13)),
+              ],
+            ),
+          ),
+          Padding(
+            padding: EdgeInsets.fromLTRB(12, 0, 12, 6),
+            child: Text(
+              "Handbrake: • Door: • Ignition: •",
+              style: TextStyle(fontSize: 12.5, height: 1.2),
+            ),
+          ),
+          Divider(height: 0, thickness: 0.6),
+        ],
+      ),
       itemCount: s.buffer.length,
       itemBuilder: (_, idx) {
         final e = s.buffer[s.buffer.length - 1 - idx];
@@ -233,7 +403,7 @@ class _LiveEventList extends StatelessWidget {
           label:
           'ts ${e.ts}s, RSSI ${e.rssi} dBm $rssiStatus, handbrake ${e.handBrakeStatus == 1 ? 'engaged' : 'disengaged'}',
           child: Column(
-            key: ValueKey(e.ts),
+            key: ValueKey(e.note),
             children: [
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
@@ -294,7 +464,7 @@ class _BwdAiState extends State<BwdAi> {
   @override
   void initState() {
     super.initState();
-    state = _UiState();
+    state = _UiState()..seedHistoryIfNeeded();
   }
 
   @override
@@ -360,7 +530,7 @@ class _BwdAiState extends State<BwdAi> {
 class _ConnectTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback onChanged;
-  const _ConnectTab({super.key, required this.state, required this.onChanged});
+  const _ConnectTab({required this.state, required this.onChanged});
 
   @override
   State<_ConnectTab> createState() => _ConnectTabState();
@@ -369,42 +539,54 @@ class _ConnectTab extends StatefulWidget {
 class _ConnectTabState extends State<_ConnectTab> {
   bool _scanning = false;
   List<({String name, String mac, int rssi})> _found = [];
+  Timer? _uiTick;
 
   Future<void> _scan() async {
     setState(() {
       _scanning = true;
       _found.clear();
     });
-
-    // Replace this with your actual BLE scanning logic.
-    // For now, it just shows the scanning indicator for 1.5s.
     await Future.delayed(const Duration(milliseconds: 1500));
 
-    // When devices are found, populate the _found list and call setState.
-    // e.g., _found.add((name: "BWD-123", mac: "AB:CD:...", rssi: -50));
+    final r = Random();
+    _found = List.generate(6, (_) {
+      final name = "BWD-V${300 + r.nextInt(80)}";
+      final mac = _fakeMac(r);
+      final rssi = -40 - r.nextInt(25);
+      return (name: name, mac: mac, rssi: rssi);
+    });
 
     setState(() => _scanning = false);
   }
 
   void _connect(({String name, String mac, int rssi}) d) {
     final s = widget.state;
-    // Add your BLE connection logic here.
-    // On success, update the state:
     s.connectedDevice = d.name;
     s.connectedMac = d.mac;
-    s.currentRssi = d.rssi;
+    s.startRssiTicker();
+    _uiTick?.cancel();
+    _uiTick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted && s.connectedDevice != null) setState(() {});
+    });
     s.enqueueSnack("Connected to ${d.name}");
     widget.onChanged();
   }
 
   void _disconnect() {
     final s = widget.state;
-    // Add your BLE disconnection logic here.
+    s.stopRssiTicker();
     s.connectedDevice = null;
     s.connectedMac = null;
     s.currentRssi = null;
+    _uiTick?.cancel();
     s.enqueueSnack("Disconnected.");
     widget.onChanged();
+  }
+
+  @override
+  void dispose() {
+    _uiTick?.cancel();
+    super.dispose();
   }
 
   @override
@@ -554,7 +736,7 @@ class _ConnectTabState extends State<_ConnectTab> {
 class _TrainingTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback notify;
-  const _TrainingTab({super.key, required this.state, required this.notify});
+  const _TrainingTab({required this.state, required this.notify});
 
   @override
   State<_TrainingTab> createState() => _TrainingTabState();
@@ -753,9 +935,10 @@ class _TrainingTabState extends State<_TrainingTab> with SingleTickerProviderSta
           Expanded(
             child: s.isTraining
                 ? _LiveEventList(state: s, notify: widget.notify)
-                : const Center(
-              child: Text("Live events will appear here once training starts."),
-            ),
+                : s.buffer.isEmpty
+                ? const Center(
+                child: Text("Live events will appear here once training starts."))
+                : _LiveEventList(state: s, notify: widget.notify),
           ),
         ],
       ),
@@ -948,7 +1131,7 @@ class _TrainingTabState extends State<_TrainingTab> with SingleTickerProviderSta
 class _HistoryTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback notify;
-  const _HistoryTab({super.key, required this.state, required this.notify});
+  const _HistoryTab({required this.state, required this.notify});
   @override
   State<_HistoryTab> createState() => _HistoryTabState();
 }
@@ -977,7 +1160,7 @@ class _HistoryTabState extends State<_HistoryTab> {
           const SizedBox(height: 16),
           if (total == 0)
             const Expanded(
-                child: Center(child: Text("No sessions yet. Save one from the Training tab.")))
+                child: Center(child: Text("No sessions yet. Save one from Training.")))
           else
             Expanded(
               child: ListView.builder(
