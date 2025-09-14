@@ -1,4 +1,24 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Bluetooth permissions (Android 12+) -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+
+    <!-- Optional: for Android 10/11 backwards compatibility -->
+    <uses-permission android:name="android.permission.BLUETOOTH"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
+
+    <!-- Location (needed for BLE scan on Android <12) -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+
+    <!-- Internet (needed for API calls / http.post) -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- Declare BLE feature -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true"/>
+
     <application
         android:label="ai_trainer"
         android:name="${applicationName}"

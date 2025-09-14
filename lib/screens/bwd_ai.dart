@@ -1,19 +1,189 @@
+// All new imports needed for BLE, permissions, and HTTP
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
-import 'dart:ui' show FontFeature;
+import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'dart:ui' show FontFeature;
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+// New import for Edge Impulse upload helpers
+import 'package:http_parser/http_parser.dart';
+import 'package:flutter/foundation.dart'; // for debugPrint
+import 'package:collection/collection.dart'; // For assertions
 
+// === STEP 1: STANDARDIZE ALL KEY NAMES ===
+// Add a constant class to prevent typos and standardize all key names.
+class IngestKeys {
+  static const sessionId = 'sessionId';
+  static const deviceMac = 'deviceMac';
+  static const tag = 'tag';
+  static const startedAt = 'startedAt';
+  static const endedAt = 'endedAt';
+  static const events = 'events';
+  static const timestamp = 'timestamp';
+  static const rssi = 'rssi';
+  static const handBrakeStatus = 'handBrakeStatus';
+  static const doorStatus = 'doorStatus';
+  static const ignitionStatus = 'ignitionStatus';
+  static const appVersion = 'appVersion';
+  static const firmwareVersion = 'firmwareVersion';
+}
+
+// === SHARED HELPERS (TOP-LEVEL) ===
+String _apiTagFor(String tag) {
+  switch (tag) {
+    case "baseline":
+      return "inside";
+    default:
+      return tag;
+  }
+}
+
+Future<bool> _uploadEiJson({
+  required Map<String, dynamic> eiJson,
+  required String apiKey,
+  String? fileName,
+  String? label,
+  bool toTesting = false,
+}) async {
+  final url = Uri.parse('https://ingestion.edgeimpulse.com/api/${toTesting ? "testing" : "training"}/data');
+  final res = await http.post(
+    url,
+    headers: {
+      'x-api-key': apiKey,
+      if (fileName?.isNotEmpty == true) 'x-file-name': fileName!,
+      if (label?.isNotEmpty == true) 'x-label': label!,
+      HttpHeaders.contentTypeHeader: ContentType.json.mimeType,
+    },
+    body: jsonEncode(eiJson),
+  ).timeout(const Duration(seconds: 45));
+  final ok = res.statusCode >= 200 && res.statusCode < 300;
+  if (!ok) {
+    debugPrint('EI JSON upload failed: ${res.statusCode} - ${res.body}');
+  }
+  return ok;
+}
+
+Future<bool> _uploadCsvToEdgeImpulse({
+  required String csvPath,
+  required String apiKey,
+  String? label,
+  bool toTesting = false,
+}) async {
+  final url = Uri.parse(
+      'https://ingestion.edgeimpulse.com/api/${toTesting ? "testing" : "training"}/files');
+  final req = http.MultipartRequest('POST', url)
+    ..headers['x-api-key'] = apiKey
+    ..headers['x-add-date-id'] = '1';
+  if (label != null && label.isNotEmpty) {
+    req.headers['x-label'] = label;
+  }
+  req.files.add(
+    await http.MultipartFile.fromPath(
+      'data',
+      csvPath,
+      contentType: MediaType('text', 'csv'),
+    ),
+  );
+  final res = await req.send().timeout(const Duration(seconds: 45));
+  final body = await res.stream.bytesToString();
+  final ok = res.statusCode >= 200 && res.statusCode < 300;
+  if (!ok) {
+    debugPrint('EI CSV upload failed: ${res.statusCode} - $body');
+  }
+  return ok;
+}
+
+/// NEW: A more robust payload validator with actionable error messages.
+bool _validateIngestionPayload(Map<String, dynamic> p, {void Function(String)? onError}) {
+  bool err(String m) {
+    onError?.call(m);
+    return false;
+  }
+
+  for (final k in [
+    IngestKeys.sessionId, IngestKeys.deviceMac, IngestKeys.tag,
+    IngestKeys.startedAt, IngestKeys.endedAt, IngestKeys.events
+  ]) {
+    if (!p.containsKey(k)) return err('Missing key: $k');
+  }
+
+  final ev = p[IngestKeys.events];
+  if (ev is! List || ev.isEmpty) return err('Events missing or empty');
+
+  for (final e in ev) {
+    if (e is! Map) return err('Event not a map');
+    if (e[IngestKeys.timestamp] is! double) return err('Event.timestamp must be double');
+    if (e[IngestKeys.rssi] is! double) return err('Event.rssi must be double');
+    if (e[IngestKeys.handBrakeStatus] is! int) return err('Event.handBrakeStatus must be int');
+    if (e[IngestKeys.doorStatus] is! int) return err('Event.doorStatus must be int');
+    if (e[IngestKeys.ignitionStatus] is! int) return err('Event.ignitionStatus must be int');
+  }
+  return true;
+}
+
+// === HELPER FUNCTIONS FOR ROBUST PARSING AND CLAMPING ===
+/// NEW: Safely parses a value into a number, handling potential type mismatches.
+T _num<T extends num>(Object? v, T fallback) {
+  if (v is num) return (T == int ? v.toInt() : v.toDouble()) as T;
+  if (v is String) {
+    final p = num.tryParse(v);
+    if (p != null) return (T == int ? p.toInt() : p.toDouble()) as T;
+  }
+  return fallback;
+}
+
+/// NEW: Clamps the timestamp to a non-negative value.
+double _clampTs(double ts) {
+  if (ts.isNaN || ts.isInfinite || ts < 0) return 0.0;
+  return ts;
+}
+
+/// NEW: Clamps the RSSI value to a reasonable range (-127 to 20).
+int _clampRssi(int r) {
+  if (r < -127) return -127;
+  if (r > 20) return 20;
+  return r;
+}
+
+/// NEW: Clamps RSSI as double in a reasonable range (-127.0 to 20.0).
+double _clampRssiDouble(double r) {
+  if (r < -127.0) return -127.0;
+  if (r > 20.0) return 20.0;
+  return r;
+}
+
+/// Clamps a value to be either 0 or 1, and casts it to an int.
+int _clampi01(num v) {
+  final clamped = v.clamp(0, 1);
+  return clamped.toInt();
+}
+
+/// (Optional) CSV safety function to handle special characters.
+String _csvEscape(Object? v) {
+  final s = '$v';
+  return (s.contains(',') || s.contains('\n') || s.contains('"'))
+      ? '"${s.replaceAll('"', '""')}"'
+      : s;
+}
+
+// === IMPORTANT FOR AI DEVELOPER: DATA MODELS ===
+/// Represents a single data packet received from the BWD device.
+/// This is the core unit of information for the AI model.
+/// The `toJson()` method ensures the output format matches the server's needs.
 class Event {
   final double ts;
-  final int rssi;
+  final double rssi;
   final int handBrakeStatus;
   final int doorStatus;
   final int ignitionStatus;
   final String note;
-
   Event({
     required this.ts,
     required this.rssi,
@@ -23,15 +193,36 @@ class Event {
     required this.note,
   });
 
+  // === STEP 2: FIX Event.toJson() FOR INGESTION JSON ===
+  // Use IngestKeys constants and remove the meta object.
   Map<String, dynamic> toJson() => {
-    "ts": double.parse(ts.toStringAsFixed(1)),
-    "rssi": rssi,
-    "handBrakeStatus": handBrakeStatus,
-    "doorStatus": doorStatus,
-    "ignitionStatus": ignitionStatus,
+    IngestKeys.timestamp: double.parse(ts.toStringAsFixed(1)),
+    // seconds, 0.1 precision
+    IngestKeys.rssi: double.parse(rssi.toStringAsFixed(1)),
+    IngestKeys.handBrakeStatus: handBrakeStatus,
+    IngestKeys.doorStatus: doorStatus,
+    IngestKeys.ignitionStatus: ignitionStatus,
+  };
+
+  // === STEP 6: FIX CSV EXPORT FOR EDGE IMPULSE ===
+  // New method for CSV-friendly data row
+  Map<String, dynamic> toCsvRow(String label) => {
+    "timestamp": (ts * 1000).round(),
+    // ms
+    "rssi": rssi.toStringAsFixed(1),
+    "handbrake": handBrakeStatus,
+    // Rename handBrakeStatus -> handbrake
+    "ignition": ignitionStatus,
+    // Rename ignitionStatus -> ignition
+    "door": doorStatus,
+    // Rename doorStatus -> door
+    "label": label,
+    // Add the label column
   };
 }
 
+/// Represents a full AI training session. This is the object that will be
+/// converted to a JSON payload and sent to the server.
 class TrainingSession {
   final String id;
   final String tag;
@@ -39,7 +230,6 @@ class TrainingSession {
   final DateTime startedAt;
   final DateTime endedAt;
   final List<Event> events;
-
   TrainingSession({
     required this.id,
     required this.tag,
@@ -48,219 +238,1696 @@ class TrainingSession {
     required this.endedAt,
     required this.events,
   });
-
   int get count => events.length;
   double get durationSec => events.isEmpty ? 0 : events.last.ts;
-  int get avgRssi =>
-      events.isEmpty ? 0 : (events.map((e) => e.rssi).reduce((a, b) => a + b) / events.length).round();
-  int get minRssi => events.isEmpty ? 0 : events.map((e) => e.rssi).reduce(min);
-  int get maxRssi => events.isEmpty ? 0 : events.map((e) => e.rssi).reduce(max);
+  double get avgRssi =>
+      events.isEmpty ? 0 : events.map((e) => e.rssi).reduce((a, b) => a + b) / events.length;
+  double get minRssi => events.isEmpty ? 0 : events.map((e) => e.rssi).reduce(math.min);
+  double get maxRssi => events.isEmpty ? 0 : events.map((e) => e.rssi).reduce(math.max);
 
+  /// This method is for UI preview only and will not be sent to the server.
   Map<String, dynamic> toPreviewJson() => {
     "start": {"command": "startTraining", "tag": tag, "device": device},
-    "stream": events.take(min(40, events.length)).map((e) => e.toJson()).toList(),
+    "stream": events.take(math.min(40, events.length)).map((e) => e.toJson()).toList(),
     "end": {"command": "endTrain", "flag": true, "device": device},
     "meta": {
       "count": count,
       "durationSec": double.parse(durationSec.toStringAsFixed(1)),
-      "avgRssi": avgRssi,
-      "minRssi": minRssi,
-      "maxRssi": maxRssi,
-      if (events.length > 40) "truncated": events.length - 40,
+      "avgRssi": double.parse(avgRssi.toStringAsFixed(1)),
+      "minRssi": double.parse(minRssi.toStringAsFixed(1)),
+      "maxRssi": double.parse(maxRssi.toStringAsFixed(1)),
     }
   };
+
+  // === STEP 3: FIX TrainingSession.toIngestionJson() (TOP-LEVEL FIELDS) ===
+  Map<String, dynamic> toIngestionJson({
+    required String deviceMac,
+    String? appVersion,
+    String? firmwareVersion,
+    bool includeMeta = false, // <— new
+  }) =>
+      {
+        IngestKeys.sessionId: id,
+        IngestKeys.deviceMac: deviceMac,
+        IngestKeys.tag: tag,
+        // This will be overwritten by the API tag
+        IngestKeys.startedAt: startedAt.toUtc().toIso8601String(),
+        IngestKeys.endedAt: endedAt.toUtc().toIso8601String(),
+        if (appVersion != null) IngestKeys.appVersion: appVersion,
+        if (firmwareVersion != null) IngestKeys.firmwareVersion: firmwareVersion,
+        IngestKeys.events: events.map((e) => e.toJson()).toList(),
+        if (includeMeta)
+          "meta": {
+            "device": device,
+            "count": count,
+            "durationSec": double.parse(durationSec.toStringAsFixed(1)),
+            "avgRssi": double.parse(avgRssi.toStringAsFixed(1)),
+            "minRssi": double.parse(minRssi.toStringAsFixed(1)),
+            "maxRssi": double.parse(maxRssi.toStringAsFixed(1)),
+          }
+      };
+
+  /// NEW: Generates a JSON payload in the Edge Impulse ingestion format.
+  Map<String, dynamic> toEdgeImpulseIngestionJson() {
+    final values = <List<double>>[];
+    int lastMs = -999;
+    // Iterate through the sorted events and sample at 2 Hz
+    final sortedEvents = sortedByTimestamp().events;
+    for (final e in sortedEvents) {
+      final ms = (e.ts * 1000).round();
+      if (ms - lastMs >= 500) {
+        values.add([
+          e.rssi,
+          e.handBrakeStatus.toDouble(),
+          e.ignitionStatus.toDouble(),
+          e.doorStatus.toDouble()
+        ]);
+        lastMs = ms;
+      }
+    }
+    return {
+      "protected": {
+        "ver": "v1", // FIXED: Add the required version field
+        "alg": "none" // FIXED: Add the required algorithm field
+      },
+      "signature": "UNSIGNED",
+      "payload": {
+        "device_type": "EDGE_IMPULSE_UPLOADER",
+        "interval_ms": 500,
+        "sensors": [
+          {"name": "rssi", "units": "N/A"},
+          {"name": "handbrake", "units": "N/A"},
+          {"name": "ignition", "units": "N/A"},
+          {"name": "door", "units": "N/A"}
+        ],
+        "values": values,
+      }
+    };
+  }
+
+  // === STEP 6: FIX CSV EXPORT FOR EDGE IMPULSE ===
+  // NEW: public getter from step 3 in the prompt
+  String get eiLabel {
+    switch (tag) {
+      case "approach":
+        return "Driver_Approaching_Vehicle";
+      case "enter":
+        return "Driver_Entering_Vehicle";
+      case "baseline":
+        return "Driver_Inside_Vehicle";
+      case "leave":
+        return "Driver_Leaving_Vehicle";
+      case "depart":
+        return "Driver_Walking_Away";
+      case "unauthorized_entry":
+        return "Unauthorized_Entry";
+      case "unauthorized_use_attempted":
+        return "Unauthorized_Use_Attempted";
+      default:
+        return tag;
+    }
+  }
+
+  List<Map<String, dynamic>> toCsvData() {
+    final correctedTag = eiLabel; // Use the public getter
+    final List<Event> sampledEvents = [];
+    int lastMs = -999;
+    for (final e in events) {
+      final ms = (e.ts * 1000).round();
+      if (ms - lastMs >= 500) {
+        // enforce 2 Hz
+        sampledEvents.add(e);
+        lastMs = ms;
+      }
+    }
+    return sampledEvents.map((e) => e.toCsvRow(correctedTag)).toList();
+  }
+}
+
+// === STEP 5: SORT EVENTS BEFORE SUBMIT ===
+// Add a new extension method to TrainingSession.
+extension TrainingSessionSorting on TrainingSession {
+  TrainingSession sortedByTimestamp() {
+    final sorted = List<Event>.from(events)..sort((a, b) => a.ts.compareTo(b.ts));
+    final newEnded = startedAt.add(Duration(
+        milliseconds:
+        sorted.isEmpty ? 0 : (sorted.last.ts * 1000).round()));
+    return TrainingSession(
+      id: id,
+      tag: tag,
+      device: device,
+      startedAt: startedAt,
+      endedAt: newEnded,
+      events: sorted,
+    );
+  }
 }
 
 class _UiState {
   String? connectedDevice;
   String? connectedMac;
   int? currentRssi;
-  Timer? _rssiTimer;
-
   bool isTraining = false;
   String? selectedTag;
   DateTime? trainingStartReal;
-  double _tsCursor = 0.0;
-  Timer? _streamTimer;
+// This is the buffer that holds the live-streamed data.
   final List<Event> buffer = [];
-
   final List<TrainingSession> history = [];
-
   final List<String> _snack = [];
-
-  bool _seeded = false;
-
-  void seedHistoryIfNeeded() {
-    if (_seeded) return;
-    _seeded = true;
-    final now = DateTime.now();
-    final rand = Random();
-    for (int i = 0; i < 6; i++) {
-      final device = "BWD-V${300 + rand.nextInt(80)}";
-      final mac = _fakeMac(rand);
-      final tag = _tags[rand.nextInt(_tags.length)];
-      final started =
-      now.subtract(Duration(days: rand.nextInt(7) + 1, minutes: rand.nextInt(160)));
-      final events = _fakeEvents(rand, count: 120 + rand.nextInt(80));
-      final ended = started.add(Duration(milliseconds: (events.last.ts * 1000).round()));
-      history.add(TrainingSession(
-        id: "HIST-${now.millisecondsSinceEpoch}-$i",
-        tag: tag,
-        device: "$device ($mac)",
-        startedAt: started,
-        endedAt: ended,
-        events: events,
-      ));
-    }
-    history.sort((a, b) => b.endedAt.compareTo(a.endedAt));
-  }
-
-  void startRssiTicker() {
-    _rssiTimer?.cancel();
-    if (connectedDevice == null) return;
-    final rand = Random();
-    currentRssi = -55;
-    _rssiTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      final jitter = rand.nextInt(5) - 2;
-      currentRssi = (((currentRssi ?? -55) + jitter).clamp(-65, -40)).toInt();
-    });
-  }
-
-  void stopRssiTicker() {
-    _rssiTimer?.cancel();
-    _rssiTimer = null;
-    currentRssi = null;
-  }
-
+  final int _bufferCap = 50000;
+// NEW: Buffer for fragmented JSON packets
+  String _notifyBuf = "";
+// FIX B: New flag to signal a pending endTrain command
+  bool pendingEndTrain = false;
   void enqueueSnack(String m) => _snack.add(m);
   String? takeSnack() => _snack.isEmpty ? null : _snack.removeAt(0);
-
-  void dispose() {
-    _rssiTimer?.cancel();
-    _streamTimer?.cancel();
-  }
-
-  void startTraining() {
-    isTraining = true;
-    buffer.clear();
-    trainingStartReal = DateTime.now();
-    _tsCursor = 0.0;
-
-    final rand = Random();
-    _streamTimer?.cancel();
-
-    void tick() {
-      if (!isTraining) return;
-      final gapMs = 400 + rand.nextInt(300);
-      _streamTimer = Timer(Duration(milliseconds: gapMs), () {
-        if (!isTraining) return;
-        _tsCursor += gapMs / 1000.0;
-        final last = buffer.isEmpty ? (currentRssi ?? -58) : buffer.last.rssi;
-        final drift = rand.nextInt(5) - 2;
-        final rssi = ((last + drift).clamp(-80, -35)).toInt();
-
-        final hb = rand.nextInt(100) < 70 ? 1 : 0;
-        final door = rand.nextInt(100) < 15 ? 1 : 0;
-        int ign;
-        switch (selectedTag) {
-          case "approach":
-          case "baseline":
-            ign = rand.nextInt(100) < 10 ? 1 : 0;
-            break;
-          case "enter":
-          case "leave":
-          case "depart":
-            ign = rand.nextInt(100) < 45 ? 1 : 0;
-            break;
-          default:
-            ign = 0;
-        }
-
-        buffer.add(Event(
-          ts: double.parse(_tsCursor.toStringAsFixed(1)),
-          rssi: rssi,
-          handBrakeStatus: hb,
-          doorStatus: door,
-          ignitionStatus: ign,
-          note: "pkt#${buffer.length + 1}",
-        ));
-
-        tick();
-      });
-    }
-
-    tick();
-  }
-
-  TrainingSession endTrainingAndBuildSession() {
-    isTraining = false;
-    _streamTimer?.cancel();
-    _streamTimer = null;
-    final started = trainingStartReal ?? DateTime.now();
-    final ended =
-    started.add(Duration(milliseconds: buffer.isEmpty ? 0 : (buffer.last.ts * 1000).round()));
-    return TrainingSession(
-      id: "SESS-${DateTime.now().millisecondsSinceEpoch}",
-      tag: selectedTag ?? "baseline",
-      device: (connectedDevice ?? "Unknown") + (connectedMac != null ? " ($connectedMac)" : ""),
-      startedAt: started,
-      endedAt: ended,
-      events: List<Event>.from(buffer),
-    );
-  }
-
   void discardTraining() {
     isTraining = false;
-    _streamTimer?.cancel();
-    _streamTimer = null;
     buffer.clear();
   }
 }
 
-const _tags = ["approach", "enter", "leave", "depart", "baseline"];
+// === CONSTANTS DEFINED HERE ===
+const bool kDemoMode = bool.fromEnvironment('DEMO', defaultValue: true);
+const String kServerUrl = kDemoMode
+    ? "https://httpbin.org/post" // echoes your payload back
+    : "https://your.api.endpoint/train";
+// FIX 3: Replaces 'baseline' with 'inside' to align with the AI model's taxonomy
+// The 'baseline' tag is still used internally but is mapped to 'inside' for the AI model.
+const _tags = [
+  "approach",
+  "enter",
+  "leave",
+  "depart",
+  "baseline",
+  "unauthorized_entry",
+  "unauthorized_use_attempted",
+];
 const kCardRadius = 12.0;
 const kCardElevation = 4.0;
-
-String _fakeMac(Random r) {
+const Duration kStreamTimeout = Duration(seconds: 7);
+// === STEP 8: CONFIGURE SERVER URL ===
+const String kBwdServiceUuid = "fecdcb88-8e90-11ee-b9d1-0242ac120002";
+const String kBwdRssiCharUuid = "fecdce67-8e90-11ee-b9d1-0242ac120002";
+// NOTE: This UUID is intentionally different from others, as confirmed by the firmware team.
+const String kBwdCtrlCharUuid = "fecdce99-8e90-11ee-b9d1-02123c1a000a";
+const String kBwdStateCharUuid = "fecdce68-8e90-11ee-b9d1-0242ac120002";
+// Re-using helper functions
+String _fakeMac(math.Random r) {
   String two() => r.nextInt(256).toRadixString(16).padLeft(2, '0').toUpperCase();
   return "D1:9A:${two()}:${two()}:${two()}:${two()}";
 }
 
-List<Event> _fakeEvents(Random r, {int count = 150}) {
-  final out = <Event>[];
-  double ts = 0.0;
-  int rssi = -60 + r.nextInt(8);
-  for (int i = 0; i < count; i++) {
-    final gap = 400 + r.nextInt(300);
-    ts += gap / 1000.0;
-    rssi = ((rssi + (r.nextInt(5) - 2)).clamp(-80, -35)).toInt();
-    out.add(Event(
-        ts: double.parse(ts.toStringAsFixed(1)),
-        rssi: rssi,
-        handBrakeStatus: r.nextInt(100) < 70 ? 1 : 0,
-        doorStatus: r.nextInt(100) < 15 ? 1 : 0,
-        ignitionStatus: r.nextInt(100) < 35 ? 1 : 0,
-        note: "pkt#${i + 1}"),
+class _TagSelector extends StatelessWidget {
+  final String? selected;
+  final bool enabled;
+  final ValueChanged<String> onSelected;
+  const _TagSelector({
+    required this.selected,
+    required this.enabled,
+    required this.onSelected,
+  });
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: _tags.map((t) {
+        final isSel = t == selected;
+        return ChoiceChip(
+          label: Text(t),
+          selected: isSel,
+          onSelected: enabled ? (_) => onSelected(t) : null,
+        );
+      }).toList(),
     );
   }
-  return out;
 }
 
-const int _RSSI_GOOD = -50;
-const int _RSSI_OK = -70;
+// The main application widget
+class BwdAi extends StatefulWidget {
+  const BwdAi({super.key});
+  @override
+  State<BwdAi> createState() => _BwdAiState();
+}
 
+class _BwdAiState extends State<BwdAi> {
+  int _tab = 0;
+  late final _UiState state;
+// New BLE-related state variables from gauge_screen.dart
+  final List<ScanResult> _devices = [];
+  StreamSubscription<List<ScanResult>>? _scanSub;
+  BluetoothDevice? _connectedDevice;
+  StreamSubscription<BluetoothConnectionState>? _connSub;
+  BluetoothCharacteristic? _ctrlChar;
+  BluetoothCharacteristic? _rssiChar; // Renamed to _rssiChar for clarity
+  StreamSubscription<List<int>>? _notifySub;
+  Timer? _streamWatchdog;
+  StreamSubscription<BluetoothAdapterState>? _adapterStateSub;
+// NEW: Variables to capture firmware version and state characteristic.
+  BluetoothCharacteristic? _stateChar;
+  String? _cachedFwVersion;
+// New variables for the reconnection loop
+  Timer? _reconnectTimer;
+  int _retries = 0;
+  BluetoothDevice? _lastDevice;
+  final _rng = math.Random();
+
+  // New timer for demo mode streaming
+  Timer? _demoTimer;
+  double _demoTime = 0.0;
+
+  @override
+  void initState() {
+    super.initState();
+    state = _UiState();
+    _initBluetooth();
+  }
+
+  @override
+  void dispose() {
+    _teardownConnection();
+    _demoTimer?.cancel();
+    _scanSub?.cancel();
+    _scanSub = null;
+    _adapterStateSub?.cancel();
+    _adapterStateSub = null;
+    FlutterBluePlus.stopScan().catchError((_) {});
+    super.dispose();
+  }
+
+  // === BLE Core functions ===
+  Future<void> _initBluetooth() async {
+    if (kDemoMode) {
+      state.connectedDevice = "BWD-DEMO";
+      state.connectedMac = "D1:9A:AA:BB:CC:DD";
+      if (mounted) setState(() {});
+      return;
+    }
+    if (Platform.isAndroid) {
+      final statuses = await [
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        Permission.location,
+      ].request();
+      if (statuses.values.any((s) => !s.isGranted)) {
+        state.enqueueSnack("Permissions denied.");
+        return;
+      }
+    }
+    _adapterStateSub = FlutterBluePlus.adapterState.listen((s) async {
+      if (s == BluetoothAdapterState.on) {
+        if (state.connectedDevice == null) {
+          _startScan();
+        }
+      } else {
+        _stopReconnect();
+        if (state.isTraining) {
+          await _sendEndTraining(false);
+          state.discardTraining();
+        }
+        state.enqueueSnack("Bluetooth is off. Please enable it.");
+        if (mounted) {
+          setState(() {
+            state.connectedDevice = null;
+            state.connectedMac = null;
+            state.currentRssi = null;
+          });
+        }
+      }
+    });
+  }
+
+  void _startScan() async {
+    _devices.clear();
+    state.enqueueSnack("Scanning for BWD devices...");
+    _scanSub?.cancel();
+    // FIX: Add fallback for nameless devices by checking for the BWD service UUID
+    _scanSub = FlutterBluePlus.scanResults.listen((results) {
+      for (final r in results) {
+        final name = r.advertisementData.advName;
+        // FIX: Replaced .str with .toString() for better compatibility
+        // FIX: Make the UUID check case-insensitive for robustness
+        final hasBwdSvc = r.advertisementData.serviceUuids
+            .map((u) => u.toString().toLowerCase())
+            .contains(kBwdServiceUuid.toLowerCase());
+        if ((name.isNotEmpty && name.startsWith('BWD')) || hasBwdSvc) {
+          final idx = _devices.indexWhere((e) => e.device.remoteId == r.device.remoteId);
+          if (idx == -1) {
+            _devices.add(r);
+          } else {
+            _devices[idx] = r; // update RSSI
+          }
+        }
+      }
+    });
+    setState(() {});
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 3));
+  }
+
+  Future<void> _teardownConnection() async {
+    _notifySub?.cancel();
+    _notifySub = null;
+    _streamWatchdog?.cancel();
+    _streamWatchdog = null;
+    await _connSub?.cancel();
+    _connSub = null;
+    _ctrlChar = null;
+    _rssiChar = null;
+    _reconnectTimer?.cancel();
+    _retries = 0;
+    if (_connectedDevice != null) {
+      try {
+        await _connectedDevice!.disconnect();
+      } catch (_) {}
+      _connectedDevice = null;
+    }
+  }
+
+  void _stopReconnect() {
+    _reconnectTimer?.cancel();
+    _retries = 0;
+  }
+
+  void _beginAutoReconnect() {
+    _reconnectTimer?.cancel();
+    final jitter = _rng.nextInt(200).toDouble() / 1000.0;
+    final delay = Duration(
+        milliseconds:
+        (1000 * (1 << _retries)).clamp(1000, 30000) + (jitter * 1000).toInt());
+    state.enqueueSnack(
+        "Attempting reconnect in ${delay.inSeconds}s (Retry ${_retries + 1})...");
+    _reconnectTimer = Timer(delay, () async {
+      if (_lastDevice == null) return;
+      _retries++;
+      try {
+        await _lastDevice!
+            .connect(timeout: const Duration(seconds: 10), autoConnect: false);
+        _retries = 0;
+        _connectedDevice = _lastDevice;
+// FIX: Replaced .str with .toString()
+        state.connectedDevice =
+            _lastDevice?.platformName ?? _lastDevice?.remoteId.toString();
+        state.connectedMac = _lastDevice?.remoteId.toString();
+        state.enqueueSnack("Reconnected to ${state.connectedDevice ?? ''}.");
+        await _discoverServices();
+        if (mounted) setState(() {});
+      } catch (_) {
+        _beginAutoReconnect();
+      }
+    });
+  }
+
+  Future<void> _connectToDevice(BluetoothDevice d) async {
+    _teardownConnection();
+    _lastDevice = d;
+// ensure scanning is stopped before connecting
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {}
+    await _scanSub?.cancel();
+    _scanSub = null;
+// prefer platformName when connected
+// FIX: Replaced .str with .toString()
+    final displayName =
+    d.platformName?.isNotEmpty == true ? d.platformName : d.remoteId.toString();
+    state.enqueueSnack("Connecting to $displayName...");
+    try {
+      await d.connect(timeout: const Duration(seconds: 10), autoConnect: false);
+// NEW: Request a larger MTU on Android to reduce packet fragmentation
+      if (Platform.isAndroid) {
+        try {
+          await d.requestMtu(247);
+        } catch (_) {}
+      }
+      _connectedDevice = d;
+      state.connectedDevice = displayName;
+      state.connectedMac = d.remoteId.toString();
+      _connSub = d.connectionState.listen((s) async {
+        if (s == BluetoothConnectionState.disconnected) {
+          if (state.isTraining) {
+            state.pendingEndTrain = true; // queue endTrain(false) for next reconnect
+            state.discardTraining();
+            state.enqueueSnack("Disconnected: training ended.");
+            if (mounted) setState(() {});
+          } else {
+            state.enqueueSnack("Disconnected.");
+          }
+          await _teardownConnection();
+          _beginAutoReconnect();
+        }
+      });
+      await _discoverServices();
+      // Add a quick if (!mounted) return; after await in _connectToDevice right before setState
+      if (!mounted) return;
+      setState(() {});
+    } catch (e) {
+      state.enqueueSnack("Failed to connect: $e");
+      await _teardownConnection();
+      _beginAutoReconnect();
+    }
+  }
+
+  /// PATCH: Now captures the firmware version and sets the _stateChar handle.
+  Future<void> _discoverServices() async {
+    if (_connectedDevice == null) return;
+    try {
+      final services = await _connectedDevice!.discoverServices();
+// Bind from the BWD service only (safer)
+      final bwdSvc = services.firstWhere(
+        // FIX: Make this UUID check case-insensitive too for robustness
+            (svc) => svc.uuid.toString().toLowerCase() == kBwdServiceUuid.toLowerCase(),
+        orElse: () => throw 'BWD service not found',
+      );
+      for (final c in bwdSvc.characteristics) {
+        final id = c.uuid.toString().toLowerCase();
+        if (id == kBwdCtrlCharUuid.toLowerCase()) _ctrlChar = c;
+        if (id == kBwdRssiCharUuid.toLowerCase()) _rssiChar = c;
+// NEW: Get the characteristic for the firmware version
+        if (id == kBwdStateCharUuid.toLowerCase()) _stateChar = c;
+      }
+      state.enqueueSnack("Services discovered.");
+// NEW: Read the firmware version once and cache it.
+      try {
+        final raw = await _stateChar?.read();
+        if (raw != null && raw.isNotEmpty) {
+          _cachedFwVersion = utf8.decode(raw).trim();
+          state.enqueueSnack("Firmware Version: $_cachedFwVersion");
+        }
+      } catch (_) {
+// Ignore errors, it's an optional field
+      }
+      // If we dropped mid-session, make sure device state is cleared
+      if (state.pendingEndTrain && _ctrlChar != null) {
+        try {
+          await _sendEndTraining(false);
+        } catch (_) {}
+        state.pendingEndTrain = false;
+      }
+      // Add a quick if (!mounted) return; in _discoverServices when calling setState()
+      if (!mounted) return;
+      setState(() {});
+    } catch (e) {
+      state.enqueueSnack("Service discovery failed: $e");
+    }
+  }
+
+  Future<void> _safeWrite(BluetoothCharacteristic ch, List<int> data) async {
+    try {
+      await ch.write(data, withoutResponse: true);
+    } catch (_) {
+      await ch.write(data, withoutResponse: false);
+    }
+  }
+
+  void _kickStreamWatchdog() {
+    _streamWatchdog?.cancel();
+    _streamWatchdog = Timer(kStreamTimeout, () async {
+      if (mounted) {
+        if (state.isTraining) {
+          await _sendEndTraining(false);
+          state.discardTraining();
+        }
+        state.enqueueSnack("Stream timed out. Disconnecting.");
+        await _teardownConnection();
+        _beginAutoReconnect();
+      }
+    });
+  }
+
+// === NEW TRAINING METHODS FOR AI DEVELOPER'S NEEDS ===
+  /// Sends the "startTraining" command to the BWD device.
+  /// The device will then begin streaming training packets.
+  Future<void> _sendStartTraining(String tag) async {
+    if (kDemoMode) {
+      state.isTraining = true;
+      state.buffer.clear();
+      _demoTime = 0.0;
+      final rnd = math.Random();
+      _demoTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
+        if (!mounted || !state.isTraining) {
+          timer.cancel();
+          return;
+        }
+        final e = Event(
+          ts: _demoTime,
+          rssi: (-65 + rnd.nextInt(5)).toDouble(),
+          handBrakeStatus: _clampi01(1),
+          doorStatus: _clampi01((_demoTime > 4 && _demoTime < 6) ? 1 : 0),
+          ignitionStatus: _clampi01((_demoTime >= 2) ? 1 : 0),
+          note: "demo#${state.buffer.length + 1}",
+        );
+        state.buffer.add(e);
+        state.currentRssi = e.rssi.round();
+        setState(() {});
+        _demoTime += 0.5;
+        if (_demoTime >= 20.0) {
+          _sendEndTraining(true);
+        }
+      });
+      state.enqueueSnack('Demo stream started.');
+      return;
+    }
+    if (_ctrlChar == null) {
+      state.enqueueSnack("Control characteristic not found.");
+      return;
+    }
+    final payload = jsonEncode({"command": "startTraining", "tag": tag});
+    await _safeWrite(_ctrlChar!, utf8.encode(payload));
+    _subscribeTraining();
+  }
+
+  /// PATCH: Now also disables notifications on the characteristic and resets the UI state immediately.
+  Future<void> _sendEndTraining(bool save) async {
+    if (kDemoMode) {
+      _demoTimer?.cancel();
+      state.isTraining = false;
+      if (mounted) setState(() {});
+      state.enqueueSnack('Demo stream ended.');
+      return;
+    }
+    if (_ctrlChar == null) {
+      state.enqueueSnack("Control characteristic not found.");
+      return;
+    }
+    final payload = jsonEncode({"command": "endTrain", "flag": save});
+    await _safeWrite(_ctrlChar!, utf8.encode(payload));
+    await Future.delayed(const Duration(milliseconds: 200)); // allow tail packets
+    try {
+      await _rssiChar?.setNotifyValue(false);
+    } catch (_) {} // NEW: Disable notifications on the BLE device
+    await _notifySub?.cancel();
+    _notifySub = null;
+    _streamWatchdog?.cancel(); // Cancel watchdog immediately
+    _streamWatchdog = null;
+    state.isTraining = false;
+// NEW: Clear the line buffer to prevent stale data on the next session
+    state._notifyBuf = "";
+    if (mounted) setState(() {});
+  }
+
+  /// Subscribes to the characteristic that streams the training data.
+  /// This is where the real-time data flow begins.
+  Future<void> _subscribeTraining() async {
+    if (_rssiChar == null) {
+      state.enqueueSnack('Training stream characteristic not found.');
+      return;
+    }
+// NEW: Clear the buffer at the beginning of a new session
+    state._notifyBuf = "";
+    bool ok = false;
+    try {
+      await _rssiChar!.setNotifyValue(true);
+      ok = true;
+    } catch (e) {
+      state.enqueueSnack("Failed to enable notifications: $e");
+    }
+    if (!ok) return;
+    _notifySub?.cancel();
+// This listener handles the incoming streamed data and buffers it.
+    _notifySub = _rssiChar!.value.listen(_handleTrainingNotify);
+    state.isTraining = true;
+    state.buffer.clear();
+    _kickStreamWatchdog();
+    setState(() {});
+  }
+
+  /// FIX: Replaces the simple newline parser with a more robust one that handles
+  /// both newline-delimited and brace-balanced JSON.
+  void _handleTrainingNotify(List<int> bytes) {
+    _kickStreamWatchdog();
+    state._notifyBuf += utf8.decode(bytes);
+// First try newline framing
+    int nl;
+    while ((nl = state._notifyBuf.indexOf('\n')) != -1) {
+      final line = state._notifyBuf.substring(0, nl).trim();
+      state._notifyBuf = state._notifyBuf.substring(nl + 1);
+      if (line.isNotEmpty) _parseEventLine(line);
+    }
+// Fallback: brace-balanced parse if no newlines
+    int depth = 0, start = -1;
+    for (int i = 0; i < state._notifyBuf.length; i++) {
+      final ch = state._notifyBuf[i];
+      if (ch == '{') {
+        if (depth++ == 0) start = i;
+      }
+      if (ch == '}') {
+        if (--depth == 0 && start != -1) {
+          final jsonStr = state._notifyBuf.substring(start, i + 1);
+          _parseEventLine(jsonStr);
+          state._notifyBuf = state._notifyBuf.substring(i + 1);
+          i = -1; // restart scan
+          start = -1;
+        }
+      }
+    }
+  }
+
+  // FIXED: The _parseEventLine method is now correctly a member of _BwdAiState
+  void _parseEventLine(String line) {
+    try {
+      final Map<String, dynamic> p = json.decode(line);
+      final rssiSrc = p.containsKey('rssi')
+          ? p['rssi']
+          : (p.containsKey('RSSI') ? p['RSSI'] : -127);
+      final event = Event(
+        ts: _clampTs(_num<double>(p['timestamp'], 0.0)),
+        // Accepts both int and float; rounds once
+        rssi: _clampRssiDouble(_num<double>(rssiSrc, -127.0)),
+        // If firmware ever sends lowercase, add a synonym read
+        handBrakeStatus: _clampi01(_num<int>(
+            p.containsKey('handBrakeStatus') ? p['handBrakeStatus'] : p['handbrake'], 0)),
+        doorStatus: _clampi01(_num<int>(
+            p.containsKey('doorStatus') ? p['doorStatus'] : p['door'], 0)),
+        ignitionStatus: _clampi01(_num<int>(p.containsKey('ignitionStatus')
+            ? p['ignitionStatus']
+            : p['ignition'], 0)),
+        note: "pkt#${state.buffer.length + 1}",
+      );
+      final last = state.buffer.isNotEmpty ? state.buffer.last.ts : null;
+      if (last != null && event.ts < last) {
+        state.enqueueSnack("Warning: Out-of-order packet received (kept).");
+      }
+      setState(() {
+        if (state.buffer.length >= state._bufferCap) {
+          state.buffer.removeAt(0);
+        }
+        state.currentRssi = event.rssi.round();
+        state.buffer.add(event);
+      });
+    } catch (e) {
+      state.enqueueSnack("Failed to parse training data: $e");
+    }
+  }
+
+  // A super-light retry on transient 5xx
+  Future<http.Response> _postWithRetry(Uri uri, {required Map<String,String> headers, required String body}) async {
+    int attempt = 0;
+    while (true) {
+      try {
+        final res = await http.post(uri, headers: headers, body: body).timeout(const Duration(seconds: 15));
+        if (res.statusCode < 500 || res.statusCode >= 600 || attempt >= 2) return res;
+      } catch (_) {
+        if (attempt >= 2) rethrow;
+      }
+      await Future.delayed(Duration(milliseconds: 400 * (1 << attempt)));
+      attempt++;
+    }
+  }
+
+  /// This function is responsible for sending the buffered data to the AI developer's server.
+  /// It now uses the new, ingestion-friendly payload.
+  Future<bool> _submitSession(TrainingSession session) async {
+    // --- DEMO: simulate a successful submit so the flow + History work ---
+    if (kDemoMode) {
+      await Future.delayed(const Duration(milliseconds: 300));
+      state.enqueueSnack("Demo: submit simulated ✅ (not sent to server)");
+      return true; // <-- allows History insert + sheet to close
+    }
+
+// NEW: Block submission if device MAC is missing.
+    if ((state.connectedMac ?? "").isEmpty) {
+      state.enqueueSnack("Device MAC missing. Please reconnect and try again.");
+      return false;
+    }
+// NEW: Basic validation to prevent submission of invalid sessions
+    if (session.tag.isEmpty || session.count == 0 || session.durationSec <= 0) {
+      state.enqueueSnack("Nothing to submit (tag/events/duration invalid).");
+      return false;
+    }
+// PATCH: Add submission size guard as a sanity check.
+    if (session.count > 10000) {
+      state.enqueueSnack(
+          "Large session (${session.count} events). Consider splitting.");
+// You can decide to return false here if the payload is too large for your backend
+    }
+// PATCH 4: Guard against placeholder URL
+    if (kServerUrl.isEmpty ||
+        kServerUrl.contains('your.api.endpoint') ||
+        kServerUrl.contains('<your-backend>')) {
+      state.enqueueSnack("Server URL not configured. Submissions blocked.");
+      return false;
+    }
+
+// === STEP 5: SORT EVENTS BEFORE SUBMIT ===
+    final sorted = session.sortedByTimestamp();
+// === STEP 9: ADD A PAYLOAD VALIDATOR ===
+    final payload = sorted.toIngestionJson(
+      deviceMac: state.connectedMac ?? "UNKNOWN", // NEW: Provide the raw MAC
+      appVersion: "1.0.0", // New field as requested
+      firmwareVersion: _cachedFwVersion, // New optional field
+      includeMeta: false, // Force this to false to ensure a flat payload
+    );
+
+    // FIX: Apply the API tag mapping here
+    payload[IngestKeys.tag] = _apiTagFor(sorted.tag);
+
+    // Tiny hardening nit: assert that CSV headers are stable in debug mode.
+    assert(
+    const DeepCollectionEquality().equals(
+      (payload[IngestKeys.events] as List).first.keys.toSet(),
+      {
+        IngestKeys.timestamp,
+        IngestKeys.rssi,
+        IngestKeys.handBrakeStatus,
+        IngestKeys.doorStatus,
+        IngestKeys.ignitionStatus,
+      }.toSet(),
+    ),
+    'CSV columns mismatch. Check Event.toJson()',
+    );
+
+    if (!_validateIngestionPayload(payload, onError: state.enqueueSnack)) {
+      state.enqueueSnack("Payload validation failed!");
+      return false;
+    }
+
+    try {
+      final uri = Uri.parse(kServerUrl);
+      final res = await _postWithRetry(
+        uri,
+        headers: {
+          HttpHeaders.contentTypeHeader: ContentType.json.mimeType,
+          HttpHeaders.acceptHeader: 'application/json',
+// NEW: Optional API key header for authentication
+          if (const String.fromEnvironment('BWD_API_KEY').isNotEmpty)
+            'x-api-key': const String.fromEnvironment('BWD_API_KEY'),
+        },
+        body: jsonEncode(payload),
+      );
+      final ok = res.statusCode >= 200 && res.statusCode < 300;
+      state.enqueueSnack(ok
+          ? "Session submitted successfully!"
+          : "Submission failed: HTTP ${res.statusCode}");
+// FIX: Add a helpful snackbar message for large payload failures
+      if (res.statusCode == 413) {
+        state.enqueueSnack(
+            "Submission failed: Session too large for the server. Consider splitting.");
+      }
+      return ok;
+    } on SocketException {
+      state.enqueueSnack("No internet connection.");
+      return false;
+    } on TimeoutException {
+      state.enqueueSnack("Submission timed out. Please try again.");
+      return false;
+    } catch (e) {
+      state.enqueueSnack("Submission failed: $e");
+      return false;
+    }
+  }
+
+  // Main UI remains unchanged, just calling the new methods
+  @override
+  Widget build(BuildContext context) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final m = state.takeSnack();
+      if (m != null && mounted) {
+        final messenger = ScaffoldMessenger.of(context);
+        messenger.clearSnackBars();
+        messenger.showSnackBar(SnackBar(content: Text(m)));
+      }
+    });
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('BWD AI Training'),
+        centerTitle: true,
+        actions: [
+          PopupMenuButton<String>(
+            onSelected: (v) {
+              if (v == 'reset') {
+                setState(() {
+                  state.discardTraining();
+                  state.selectedTag = null;
+                  state.connectedDevice = null;
+                  state.connectedMac = null;
+                  state.currentRssi = null;
+                  _teardownConnection();
+                });
+                state.enqueueSnack("Training state reset.");
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                  value: 'reset', child: Text('Reset Training State')),
+            ],
+          ),
+        ],
+      ),
+      body: IndexedStack(
+        index: _tab,
+        children: [
+          _ConnectTab(
+            state: state,
+            onChanged: () => setState(() {}),
+            devices: _devices,
+            startScan: _startScan,
+            connectToDevice: _connectToDevice,
+            disconnect: () async {
+              _lastDevice = null;
+              await _teardownConnection();
+              state.discardTraining();
+              setState(() {
+                state.connectedDevice = null;
+                state.connectedMac = null;
+                state.currentRssi = null;
+              });
+              state.enqueueSnack("Disconnected.");
+            },
+            isConnected: state.connectedDevice != null,
+          ),
+          _TrainingTab(
+            state: state,
+            notify: () => setState(() {}),
+            startTraining: _sendStartTraining,
+            endTraining: _sendEndTraining,
+            submitSession: _submitSession, // Pass the new function
+          ),
+          _HistoryTab(state: state, notify: () => setState(() {})),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tab,
+        onDestinationSelected: (i) => setState(() => _tab = i),
+        destinations: const [
+          NavigationDestination(
+              icon: Icon(Icons.bluetooth_searching), label: 'Connect'),
+          NavigationDestination(icon: Icon(Icons.timeline), label: 'Training'),
+          NavigationDestination(icon: Icon(Icons.history), label: 'History'),
+        ],
+      ),
+    );
+  }
+}
+
+// =================== UPDATED CONNECT TAB ===================
+class _ConnectTab extends StatefulWidget {
+  final _UiState state;
+  final VoidCallback onChanged;
+  final List<ScanResult> devices;
+  final VoidCallback startScan;
+  final Function(BluetoothDevice d) connectToDevice;
+  final VoidCallback disconnect;
+  final bool isConnected;
+  const _ConnectTab({
+    required this.state,
+    required this.onChanged,
+    required this.devices,
+    required this.startScan,
+    required this.connectToDevice,
+    required this.disconnect,
+    required this.isConnected,
+  });
+  @override
+  State<_ConnectTab> createState() => _ConnectTabState();
+}
+
+class _ConnectTabState extends State<_ConnectTab> {
+  @override
+  Widget build(BuildContext context) {
+    final s = widget.state;
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Card(
+            elevation: kCardElevation,
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(kCardRadius)),
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Device Status',
+                      style: Theme.of(context).textTheme.titleLarge),
+                  const SizedBox(height: 12),
+                  if (widget.isConnected)
+                    Column(
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Chip(
+                              avatar: const Icon(Icons.bluetooth_connected,
+                                  color: Colors.blue),
+                              label: const Text("Connected"),
+                              backgroundColor: Colors.blue.withOpacity(0.1),
+                              side: BorderSide.none,
+                            ),
+                            _rssiChip(s.currentRssi),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  s.connectedDevice ?? "",
+                                  style: Theme.of(context).textTheme.titleMedium,
+                                ),
+                                const SizedBox(height: 4),
+                                GestureDetector(
+                                  onLongPress: () {
+                                    if (s.connectedMac != null) {
+                                      Clipboard.setData(ClipboardData(text: s.connectedMac!));
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        const SnackBar(content: Text('MAC address copied')),
+                                      );
+                                    }
+                                  },
+                                  child: Text(
+                                    s.connectedMac ?? "",
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodySmall
+                                        ?.copyWith(color: Colors.grey[600]),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            OutlinedButton.icon(
+                              onPressed: widget.disconnect,
+                              icon: const Icon(Icons.bluetooth_disabled),
+                              label: const Text("Disconnect"),
+                              style: OutlinedButton.styleFrom(
+                                shape: RoundedRectangleBorder(
+                                    borderRadius:
+                                    BorderRadius.circular(kCardRadius)),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    )
+                  else
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ElevatedButton.icon(
+                            onPressed: widget.startScan,
+                            icon: const Icon(Icons.radar),
+                            label: const Text("Scan for Devices"),
+                            style: ElevatedButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 14, vertical: 10),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius:
+                                  BorderRadius.circular(kCardRadius)),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text('Available Devices',
+              style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 8),
+          Expanded(
+            child: widget.devices.isEmpty
+                ? const Center(
+              child: Text(
+                "Tap 'Scan' to discover BWD devices.",
+                textAlign: TextAlign.center,
+              ),
+            )
+                : ListView.builder(
+              itemCount: widget.devices.length,
+              itemBuilder: (_, i) {
+                final sr = widget.devices[i];
+                final d = sr.device;
+// FIX: Replaced .str with .toString()
+                final name = sr.advertisementData.advName.isNotEmpty
+                    ? sr.advertisementData.advName
+                    : (d.platformName?.isNotEmpty == true
+                    ? d.platformName
+                    : d.remoteId.toString());
+                final isSelected = s.connectedMac == d.remoteId.toString();
+                return Card(
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  elevation: isSelected ? kCardElevation : 2,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(kCardRadius),
+                    side: isSelected
+                        ? const BorderSide(color: Colors.blue, width: 2)
+                        : BorderSide.none,
+                  ),
+                  child: ListTile(
+                    contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 8),
+                    leading: const CircleAvatar(
+                      backgroundColor: Colors.blueAccent,
+                      child: Icon(Icons.bluetooth, color: Colors.white),
+                    ),
+                    title: Text(name,
+                        style: TextStyle(
+                            fontWeight: isSelected
+                                ? FontWeight.bold
+                                : FontWeight.normal)),
+                    subtitle: Text(d.remoteId.toString()),
+                    trailing: Chip(
+                      label: Text("${sr.rssi} dBm"),
+                      // NITS: Use >= for accurate bucket edges
+                      backgroundColor: _getRssiColor(sr.rssi).withOpacity(0.1),
+                      side: BorderSide.none,
+                    ),
+                    onTap: isSelected ? null : () => widget.connectToDevice(d),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// =================== UPDATED TRAINING TAB ===================
+class _TrainingTab extends StatefulWidget {
+  final _UiState state;
+  final VoidCallback notify;
+  final Function(String tag) startTraining;
+  final Function(bool save) endTraining;
+  final Future<bool> Function(TrainingSession) submitSession;
+  const _TrainingTab({
+    required this.state,
+    required this.notify,
+    required this.startTraining,
+    required this.endTraining,
+    required this.submitSession,
+  });
+  @override
+  State<_TrainingTab> createState() => _TrainingTabState();
+}
+
+class _TrainingTabState extends State<_TrainingTab>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
+  @override
+  void initState() {
+    super.initState();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 800),
+    );
+    _pulseAnimation =
+        CurvedAnimation(parent: _pulseController, curve: Curves.easeIn);
+  }
+
+  @override
+  void didUpdateWidget(covariant _TrainingTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.state.isTraining != oldWidget.state.isTraining) {
+      if (widget.state.isTraining) {
+        _pulseController.repeat(reverse: true);
+      } else {
+        _pulseController.stop();
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _confirmEnd(BuildContext context) async {
+    final s = widget.state;
+    final snap = TrainingSession(
+      id: "SESS-${DateTime.now().millisecondsSinceEpoch}",
+      tag: s.selectedTag ?? "baseline",
+      device: (s.connectedDevice ?? "Unknown") +
+          (s.connectedMac != null ? " (${s.connectedMac})" : ""),
+      startedAt: s.trainingStartReal ?? DateTime.now(),
+      endedAt: s.trainingStartReal?.add(Duration(
+          milliseconds:
+          s.buffer.isEmpty ? 0 : (s.buffer.last.ts * 1000).round())) ??
+          DateTime.now(),
+      events: List<Event>.from(s.buffer),
+    );
+    final res = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("End Training?"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _kv("Tag", snap.tag),
+            _kv("Duration", "${snap.durationSec.toStringAsFixed(1)} s"),
+            _kv("Events", "${snap.count}"),
+            _kv("Avg RSSI", "${snap.avgRssi.toStringAsFixed(1)} dBm"),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, "discard"),
+            child: const Text("Discard"),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, "save"),
+            child: const Text("Save"),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (res == "save") {
+      widget.endTraining(true);
+      await _openReviewSheet(context, snap);
+    } else if (res == "discard") {
+      widget.endTraining(false);
+      s.discardTraining();
+      s.enqueueSnack('{"command":"endTrain","flag": false} sent · Training discarded');
+      widget.notify();
+    }
+  }
+
+  Future<String?> _saveCsvToDisk(TrainingSession session) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final csvData = session.toCsvData();
+      if (csvData.isEmpty) {
+        messenger.showSnackBar(const SnackBar(content: Text("No data to export.")));
+        return null;
+      }
+
+      // Build CSV text (deterministic header order)
+      final headers = const ['timestamp', 'rssi', 'handbrake', 'ignition', 'door', 'label'];
+      final buf = StringBuffer()..writeln(headers.join(','));
+      for (final row in csvData) {
+        buf.writeln(headers.map((h) => _csvEscape(row[h])).join(','));
+      }
+      final csvString = buf.toString();
+
+      // Pick a path
+      final ts = DateTime.now().toIso8601String();
+      // Sanitization regex: your filename regex is solid.
+      final safeTs = ts.replaceAll(RegExp(r'[<>:"/\\|?*\s]+'), '-');
+      final fname = 'bwd_${session.tag}_$safeTs.csv';
+
+      Directory base;
+      if (Platform.isAndroid) {
+        // Android 11+ (scoped storage)
+        base = (await getExternalStorageDirectory())!;
+        // Create an app subfolder so users can find files easily
+        final appDir = Directory('${base.path}/BWD');
+        if (!(await appDir.exists())) await appDir.create(recursive: true);
+        base = appDir;
+      } else {
+        // iOS/macOS
+        base = await getApplicationDocumentsDirectory();
+      }
+
+      final file = File('${base.path}/$fname');
+      await file.writeAsString(csvString);
+
+      messenger.showSnackBar(SnackBar(content: Text("CSV saved to ${file.path}")));
+
+      return file.path;
+
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text("CSV export failed: $e")));
+      return null;
+    }
+  }
+
+  Future<void> _openReviewSheet(BuildContext context, TrainingSession session) async {
+    final s = widget.state;
+    bool submitEnabled = true; // Changed to true for immediate enablement
+    bool isSubmitting = false;
+    bool toTesting = false; // New state variable for the toggle
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (ctx) {
+        final preview = session.toPreviewJson();
+        final pretty = const JsonEncoder.withIndent(' ').convert(preview);
+        final messenger = ScaffoldMessenger.of(context);
+        final h = MediaQuery.of(ctx).size.height;
+        final viewInsets = MediaQuery.of(ctx).viewInsets.bottom;
+        final ScrollController scrollController = ScrollController();
+        return Padding(
+          padding: EdgeInsets.only(left: 16, right: 16, bottom: math.max(16.0, viewInsets)),
+          child: StatefulBuilder(
+            builder: (ctx2, setState) {
+              Future<void> _submitAndClose() async {
+                setState(() => isSubmitting = true);
+                final success = await widget.submitSession(session);
+                if (!mounted) return;
+                if (success) {
+                  s.history.insert(0, session);
+                  s.discardTraining();
+                  s.enqueueSnack('Session submitted.');
+                  Navigator.pop(ctx);
+                } else {
+                  setState(() => isSubmitting = false);
+                  messenger.showSnackBar(
+                    SnackBar(
+                      content: const Text("Submission failed. Retry?"),
+                      action: SnackBarAction(
+                        label: "RETRY",
+                        onPressed: _submitAndClose,
+                      ),
+                    ),
+                  );
+                }
+                widget.notify();
+              }
+              return FractionallySizedBox(
+                heightFactor: 0.92,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.only(top: 16, bottom: 8),
+                      child: Text("Review & Submit", style: Theme.of(ctx2).textTheme.titleLarge, overflow:
+                      TextOverflow.ellipsis),
+                    ),
+                    Expanded(
+                      child: ListView(
+                        controller: scrollController,
+                        padding: EdgeInsets.zero,
+                        children: [
+                          Text("Session Summary", style: Theme.of(ctx2).textTheme.titleMedium),
+                          const SizedBox(height: 8),
+                          _kv("Device", session.device),
+                          // Show both UI tag and API tag to prevent confusion
+                          _kv("Tag (UI)", session.tag),
+                          _kv("Tag (API)", _apiTagFor(session.tag)),
+                          _kv("Events", "${session.count}"),
+                          _kv("Duration", "${session.durationSec.toStringAsFixed(1)} s"),
+                          _kv("RSSI", "avg ${session.avgRssi.toStringAsFixed(1)} dBm (min ${session.minRssi.toStringAsFixed(1)} / max ${session.maxRssi.toStringAsFixed(1)})"),
+                          const SizedBox(height: 12),
+                          Text("JSON Preview", style: Theme.of(ctx2).textTheme.titleMedium),
+                          const SizedBox(height: 8),
+                          Container(
+                            constraints: BoxConstraints(
+                              maxHeight: h * 0.40,
+                            ),
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              border: Border.all(color: Theme.of(ctx2).dividerColor),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: SingleChildScrollView(
+                              child: Text(
+                                // MODIFIED: If Demo Mode, show the correct EI JSON format.
+                                kDemoMode
+                                    ? const JsonEncoder.withIndent(' ').convert(session.toEdgeImpulseIngestionJson())
+                                    : pretty,
+                                style: const TextStyle(fontFamily: 'monospace'),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          // New toggle switch for Testing vs Training set
+                          SwitchListTile(
+                            title: const Text('Upload to Testing set'),
+                            value: toTesting,
+                            onChanged: isSubmitting ? null : (v) => setState(() => toTesting = v),
+                            secondary: const Icon(Icons.psychology_outlined),
+                          ),
+                        ],
+                      ),
+                    ),
+                    SafeArea(
+                      top: false,
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 8, bottom: 8),
+                        child: LayoutBuilder(
+                          builder: (ctx3, c) {
+                            final narrow = c.maxWidth < 380; // small phones
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                Wrap(
+                                  spacing: 8,
+                                  runSpacing: 8,
+                                  alignment: WrapAlignment.spaceBetween,
+                                  children: [
+                                    OutlinedButton.icon(
+                                      icon: const Icon(Icons.copy_all),
+                                      label: const Text("Copy JSON"),
+                                      onPressed: isSubmitting ? null : () async {
+                                        // MODIFIED: In Demo Mode, copy the EI JSON instead of the preview JSON.
+                                        final content = kDemoMode
+                                            ? const JsonEncoder.withIndent(' ').convert(session.toEdgeImpulseIngestionJson())
+                                            : pretty;
+                                        await Clipboard.setData(ClipboardData(text: content));
+                                        messenger.clearSnackBars();
+                                        messenger.showSnackBar(const SnackBar(content: Text("JSON copied")));
+                                      },
+                                    ),
+                                    OutlinedButton.icon(
+                                      icon: const Icon(Icons.file_download),
+                                      label: const Text("Export EI JSON"),
+                                      onPressed: isSubmitting ? null : () async {
+                                        final messenger = ScaffoldMessenger.of(context);
+                                        try {
+                                          final eiJson = session.toEdgeImpulseIngestionJson();
+                                          final jsonString = const JsonEncoder.withIndent(' ').convert(eiJson);
+
+                                          final ts = DateTime.now().toIso8601String();
+                                          final safeTs = ts.replaceAll(RegExp(r'[<>:"/\\|?*\s]+'), '-');
+                                          final fname = 'bwd_${session.tag}_$safeTs.json';
+
+                                          Directory base;
+                                          if (Platform.isAndroid) {
+                                            base = (await getExternalStorageDirectory())!;
+                                            final appDir = Directory('${base.path}/BWD');
+                                            if (!(await appDir.exists())) await appDir.create(recursive: true);
+                                            base = appDir;
+                                          } else {
+                                            base = await getApplicationDocumentsDirectory();
+                                          }
+                                          final file = File('${base.path}/$fname');
+                                          await file.writeAsString(jsonString);
+
+                                          messenger.showSnackBar(SnackBar(content: Text("JSON saved to ${file.path}")));
+                                          await Share.shareXFiles([XFile(file.path)], text: 'Edge Impulse JSON export');
+
+                                        } catch (e) {
+                                          messenger.showSnackBar(SnackBar(content: Text("JSON export failed: $e")));
+                                        }
+                                      },
+                                    ),
+                                    OutlinedButton.icon(
+                                      icon: const Icon(Icons.ios_share),
+                                      label: const Text("Share CSV"),
+                                      onPressed: () async {
+                                        final path = await _saveCsvToDisk(session);
+                                        if (path != null) {
+                                          await Share.shareXFiles([XFile(path)], text: 'BWD session CSV');
+                                        }
+                                      },
+                                    ),
+                                    OutlinedButton.icon(
+                                      icon: const Icon(Icons.cloud_upload),
+                                      label: const Text("Upload EI JSON"),
+                                      onPressed: isSubmitting ? null : () async {
+                                        final messenger = ScaffoldMessenger.of(context);
+                                        const eiApiKey = String.fromEnvironment('EI_PROJECT_API_KEY');
+                                        if (eiApiKey.isEmpty) {
+                                          messenger.showSnackBar(const SnackBar(content: Text("Missing EI API key")));
+                                          return;
+                                        }
+
+                                        final eiJson = session.toEdgeImpulseIngestionJson();
+                                        final ok = await _uploadEiJson(
+                                          eiJson: eiJson,
+                                          apiKey: eiApiKey,
+                                          fileName: 'bwd_${session.tag}_${DateTime.now().millisecondsSinceEpoch}.json',
+                                          label: session.eiLabel,
+                                          toTesting: toTesting,
+                                        );
+                                        messenger.clearSnackBars();
+                                        messenger.showSnackBar(SnackBar(
+                                          content: Text(ok ? "Uploaded to Edge Impulse ✅" : "Upload failed ❌"),
+                                        ));
+                                      },
+                                    ),
+                                    OutlinedButton.icon(
+                                      icon: const Icon(Icons.file_upload),
+                                      label: const Text("Upload EI CSV"),
+                                      onPressed: isSubmitting ? null : () async {
+                                        final messenger = ScaffoldMessenger.of(context);
+                                        const eiApiKey = String.fromEnvironment('EI_PROJECT_API_KEY');
+                                        if (eiApiKey.isEmpty) {
+                                          messenger.showSnackBar(const SnackBar(content: Text("Missing EI API key")));
+                                          return;
+                                        }
+
+                                        final path = await _saveCsvToDisk(session);
+                                        if (path == null) {
+                                          return;
+                                        }
+                                        final ok = await _uploadCsvToEdgeImpulse(
+                                          csvPath: path,
+                                          apiKey: eiApiKey,
+                                          label: session.eiLabel,
+                                          toTesting: toTesting,
+                                        );
+                                        messenger.clearSnackBars();
+                                        messenger.showSnackBar(
+                                          SnackBar(content: Text(ok ? "Uploaded to Edge Impulse ✅" : "Upload failed ❌")),
+                                        );
+                                      },
+                                    ),
+                                    SizedBox(
+                                      width: narrow ? double.infinity : null,
+                                      child: FilledButton.icon(
+                                        icon: const Icon(Icons.send),
+                                        label: isSubmitting ? const Text("Submitting...") : const Text("Submit"),
+                                        onPressed: (submitEnabled && !isSubmitting) ? _submitAndClose : null,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            );
+                          },
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = widget.state;
+    final isConnected = s.connectedDevice != null;
+    final scheme = Theme.of(context).colorScheme;
+    final canStart = isConnected && s.selectedTag != null && !s.isTraining;
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Card(
+            elevation: kCardElevation,
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(kCardRadius)),
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          'Training Session',
+                          style: Theme.of(context).textTheme.titleLarge,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      if (s.isTraining) ...[
+                        FadeTransition(
+                          opacity: _pulseAnimation,
+                          child: const Icon(Icons.circle,
+                              size: 8, color: Colors.red),
+                        ),
+                        const SizedBox(width: 6),
+                        Text("Recording",
+                            style: Theme.of(context).textTheme.labelSmall),
+                      ],
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Container(
+                    decoration: BoxDecoration(
+                      color: scheme.brightness == Brightness.dark
+                          ? scheme.surfaceVariant.withOpacity(0.22)
+                          : scheme.surfaceVariant.withOpacity(0.32),
+                      borderRadius: BorderRadius.circular(kCardRadius),
+                    ),
+                    padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.bluetooth_connected,
+                            color: Colors.blue, size: 16),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(isConnected ? s.connectedDevice! : "No device selected",
+                                  style: Theme.of(context).textTheme.bodyMedium,
+                                  overflow: TextOverflow.ellipsis),
+                              if (isConnected && s.connectedMac != null)
+                                Text(s.connectedMac!,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .labelSmall
+                                        ?.copyWith(
+                                      color: scheme.onSurfaceVariant,
+                                      fontFeatures: const [
+                                        FontFeature.tabularFigures()
+                                      ],
+                                    ),
+                                    overflow: TextOverflow.ellipsis),
+                            ],
+                          ),
+                        ),
+                        if (isConnected) _rssiChip(s.currentRssi),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Divider(height: 0, thickness: 0.6),
+                  const SizedBox(height: 12),
+                  Text('Training Tags',
+                      style: Theme.of(context).textTheme.titleMedium),
+                  const SizedBox(height: 8),
+                  if (!isConnected)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(
+                        'Connect a BWD device in the Connect tab to start training.',
+                        style: Theme.of(context)
+                            .textTheme
+                            .labelSmall
+                            ?.copyWith(fontStyle: FontStyle.italic),
+                      ),
+                    ),
+                  if (s.selectedTag == null && !s.isTraining)
+                    Text('Choose a tag to enable Start',
+                        style: Theme.of(context)
+                            .textTheme
+                            .labelSmall
+                            ?.copyWith(fontStyle: FontStyle.italic)),
+                  _TagSelector(
+                    selected: s.selectedTag,
+                    enabled: !s.isTraining,
+                    onSelected: (t) => setState(() => s.selectedTag = t),
+                  ),
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    width: double.infinity,
+                    child: Tooltip(
+                      message: s.isTraining
+                          ? "End the current training session"
+                          : "Start the training session",
+                      child: FilledButton.icon(
+                        style: ButtonStyle(
+                          backgroundColor:
+                          MaterialStateProperty.resolveWith((states) {
+                            if (states.contains(MaterialState.disabled)) {
+                              return null;
+                            }
+                            return s.isTraining
+                                ? Colors.red.shade700
+                                : Colors.green.shade700;
+                          }),
+                          shape: MaterialStateProperty.all(
+                            RoundedRectangleBorder(
+                                borderRadius:
+                                BorderRadius.circular(kCardRadius)),
+                          ),
+                          padding: MaterialStateProperty.all(
+                              const EdgeInsets.symmetric(vertical: 8)),
+                          minimumSize: MaterialStateProperty.all(
+                              const Size.fromHeight(44)),
+                        ),
+                        icon: Icon(
+                            s.isTraining
+                                ? Icons.stop_circle_outlined
+                                : Icons.play_circle_filled,
+                            size: 20),
+                        label: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 160),
+                          transitionBuilder: (c, a) =>
+                              FadeTransition(opacity: a, child: c),
+                          child: Text(
+                            s.isTraining ? "End Training" : "Start Training",
+                            key: ValueKey(s.isTraining),
+                            style: const TextStyle(fontSize: 16),
+                          ),
+                        ),
+                        onPressed: (s.isTraining || canStart)
+                            ? () {
+                          HapticFeedback.selectionClick();
+                          if (!s.isTraining) {
+                            s.trainingStartReal = DateTime.now();
+                            widget.startTraining(s.selectedTag!);
+                            s.enqueueSnack(
+                                '{"command":"startTraining","tag":"${s.selectedTag}"} sent');
+                          } else {
+                            _confirmEnd(context);
+                          }
+                          widget.notify();
+                        }
+                            : null,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text('Live Event Stream',
+              style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 8),
+          Expanded(
+            child: s.isTraining
+                ? _LiveEventList(state: s, notify: widget.notify)
+                : s.buffer.isEmpty
+                ? const Center(
+                child: Text(
+                    "Live events will appear here once training starts."))
+                : _LiveEventList(state: s, notify: widget.notify),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+//... (The rest of the code for _HistoryTab, _LiveEventList, and helpers are unchanged)
+//...
+const int RSSI_GOOD = -50;
+const int RSSI_OK = -70;
+// RSSI bucket edge: _getRssiColor treats exactly -50 and -70 as the lower tier due to > checks. If you care, switch to >= so -50 is green and -70 is orange.
 Color _getRssiColor(int rssi) {
-  if (rssi > _RSSI_GOOD) return Colors.green;
-  if (rssi > _RSSI_OK) return Colors.orange;
+  if (rssi >= RSSI_GOOD) return Colors.green;
+  if (rssi >= RSSI_OK) return Colors.orange;
   return Colors.red;
 }
 
 Widget _rssiChip(int? rssi) {
   final has = rssi != null;
   final color = has ? _getRssiColor(rssi!) : Colors.grey;
-  final announce = has ? 'Signal strength ${rssi} dBm' : 'Signal strength unavailable';
-  final labelStyle = const TextStyle(fontSize: 12, fontFeatures: [FontFeature.tabularFigures()]);
-
+  final announce =
+  has ? 'Signal strength ${rssi} dBm' : 'Signal strength unavailable';
+  final labelStyle = const TextStyle(
+      fontSize: 12, fontFeatures: [FontFeature.tabularFigures()]);
   return Semantics(
     label: announce,
     child: Chip(
@@ -298,77 +1965,24 @@ Widget _kv(String k, String v) => Padding(
   ),
 );
 
-class _TagSelector extends StatelessWidget {
-  final String? selected;
-  final ValueChanged<String> onSelected;
-  final bool enabled;
-
-  const _TagSelector({required this.selected, required this.onSelected, required this.enabled});
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Wrap(
-      spacing: 6,
-      runSpacing: 6,
-      children: _tags.map((t) {
-        final isSel = t == selected;
-        return ChoiceChip(
-          label: Text(t,
-              overflow: TextOverflow.ellipsis, softWrap: false, style: const TextStyle(fontSize: 12)),
-          selected: isSel,
-          onSelected: enabled ? (_) => onSelected(t) : null,
-          showCheckmark: false,
-          side: BorderSide.none,
-          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          visualDensity: const VisualDensity(horizontal: -3, vertical: -3),
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 0),
-          selectedColor: scheme.primary.withOpacity(0.20),
-          backgroundColor: scheme.surfaceVariant.withOpacity(0.35),
-          elevation: isSel ? 0.5 : 0.0,
-          shape: const StadiumBorder(),
-        );
-      }).toList(),
-    );
-  }
-}
-
 class _LiveEventList extends StatefulWidget {
   final _UiState state;
   final VoidCallback notify;
-
   const _LiveEventList({required this.state, required this.notify});
-
   @override
   _LiveEventListState createState() => _LiveEventListState();
 }
 
 class _LiveEventListState extends State<_LiveEventList> {
-  Timer? _pulse;
-
-  @override
-  void initState() {
-    super.initState();
-    _pulse = Timer.periodic(const Duration(milliseconds: 100), (_) {
-      if (!mounted) return;
-      if (widget.state.isTraining) {
-        setState(() {});
-      }
-    });
-  }
-
-  @override
-  void dispose() {
-    _pulse?.cancel();
-    super.dispose();
-  }
-
+// NEW: The periodic timer for repainting has been removed since the notify listener
+// already triggers UI updates efficiently.
   @override
   Widget build(BuildContext context) {
     final s = widget.state;
     if (s.buffer.isEmpty) {
       return const Center(
-          child: Text("Initializing stream...", style: TextStyle(fontStyle: FontStyle.italic)));
+          child: Text("Initializing stream...",
+              style: TextStyle(fontStyle: FontStyle.italic)));
     }
     return ListView.builder(
       reverse: true,
@@ -380,13 +1994,14 @@ class _LiveEventListState extends State<_LiveEventList> {
             padding: EdgeInsets.symmetric(horizontal: 12, vertical: 4),
             child: Row(
               children: [
-                Expanded(child: Text("ts: 00.00s", style: TextStyle(fontSize: 13))),
+                Expanded(
+                    child: Text("ts: 00.00s", style: TextStyle(fontSize: 13))),
                 Text("RSSI: -00 dBm", style: TextStyle(fontSize: 13)),
               ],
             ),
           ),
           Padding(
-            padding: EdgeInsets.fromLTRB(12, 0, 12, 6),
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
             child: Text(
               "Handbrake: • Door: • Ignition: •",
               style: TextStyle(fontSize: 12.5, height: 1.2),
@@ -398,7 +2013,8 @@ class _LiveEventListState extends State<_LiveEventList> {
       itemCount: s.buffer.length,
       itemBuilder: (_, idx) {
         final e = s.buffer[s.buffer.length - 1 - idx];
-        final rssiStatus = e.rssi > _RSSI_GOOD ? 'good' : (e.rssi > _RSSI_OK ? 'fair' : 'poor');
+        final rssiStatus =
+        e.rssi >= RSSI_GOOD ? 'good' : (e.rssi >= RSSI_OK ? 'fair' : 'poor');
         return Semantics(
           label:
           'ts ${e.ts}s, RSSI ${e.rssi} dBm $rssiStatus, handbrake ${e.handBrakeStatus == 1 ? 'engaged' : 'disengaged'}',
@@ -406,7 +2022,8 @@ class _LiveEventListState extends State<_LiveEventList> {
             key: ValueKey(e.note),
             children: [
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
                 child: Row(
                   children: [
                     Expanded(
@@ -420,10 +2037,10 @@ class _LiveEventListState extends State<_LiveEventList> {
                       ),
                     ),
                     Text(
-                      "RSSI: ${e.rssi} dBm",
+                      "RSSI: ${e.rssi.toStringAsFixed(1)} dBm",
                       style: TextStyle(
                         fontSize: 13,
-                        color: _getRssiColor(e.rssi),
+                        color: _getRssiColor(e.rssi.round()),
                         fontFeatures: const [FontFeature.tabularFigures()],
                       ),
                       maxLines: 1,
@@ -451,683 +2068,6 @@ class _LiveEventListState extends State<_LiveEventList> {
   }
 }
 
-class BwdAi extends StatefulWidget {
-  const BwdAi({super.key});
-  @override
-  State<BwdAi> createState() => _BwdAiState();
-}
-
-class _BwdAiState extends State<BwdAi> {
-  int _tab = 0;
-  late final _UiState state;
-
-  @override
-  void initState() {
-    super.initState();
-    state = _UiState()..seedHistoryIfNeeded();
-  }
-
-  @override
-  void dispose() {
-    state.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final m = state.takeSnack();
-      if (m != null && mounted) {
-        final messenger = ScaffoldMessenger.of(context);
-        messenger.clearSnackBars();
-        messenger.showSnackBar(SnackBar(content: Text(m)));
-      }
-    });
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('BWD AI Training'),
-        centerTitle: true,
-        actions: [
-          PopupMenuButton<String>(
-            onSelected: (v) {
-              if (v == 'reset') {
-                setState(() {
-                  state.discardTraining();
-                  state.selectedTag = null;
-                  state.currentRssi = null;
-                });
-                state.enqueueSnack("Training state reset.");
-              }
-            },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'reset', child: Text('Reset Training State')),
-            ],
-          ),
-        ],
-      ),
-      body: IndexedStack(
-        index: _tab,
-        children: [
-          _ConnectTab(state: state, onChanged: () => setState(() {})),
-          _TrainingTab(state: state, notify: () => setState(() {})),
-          _HistoryTab(state: state, notify: () => setState(() {})),
-        ],
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab,
-        onDestinationSelected: (i) => setState(() => _tab = i),
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.bluetooth_searching), label: 'Connect'),
-          NavigationDestination(icon: Icon(Icons.timeline), label: 'Training'),
-          NavigationDestination(icon: Icon(Icons.history), label: 'History'),
-        ],
-      ),
-    );
-  }
-}
-
-class _ConnectTab extends StatefulWidget {
-  final _UiState state;
-  final VoidCallback onChanged;
-  const _ConnectTab({required this.state, required this.onChanged});
-
-  @override
-  State<_ConnectTab> createState() => _ConnectTabState();
-}
-
-class _ConnectTabState extends State<_ConnectTab> {
-  bool _scanning = false;
-  List<({String name, String mac, int rssi})> _found = [];
-  Timer? _uiTick;
-
-  Future<void> _scan() async {
-    setState(() {
-      _scanning = true;
-      _found.clear();
-    });
-    await Future.delayed(const Duration(milliseconds: 1500));
-
-    final r = Random();
-    _found = List.generate(6, (_) {
-      final name = "BWD-V${300 + r.nextInt(80)}";
-      final mac = _fakeMac(r);
-      final rssi = -40 - r.nextInt(25);
-      return (name: name, mac: mac, rssi: rssi);
-    });
-
-    setState(() => _scanning = false);
-  }
-
-  void _connect(({String name, String mac, int rssi}) d) {
-    final s = widget.state;
-    s.connectedDevice = d.name;
-    s.connectedMac = d.mac;
-    s.startRssiTicker();
-    _uiTick?.cancel();
-    _uiTick = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted && s.connectedDevice != null) setState(() {});
-    });
-    s.enqueueSnack("Connected to ${d.name}");
-    widget.onChanged();
-  }
-
-  void _disconnect() {
-    final s = widget.state;
-    s.stopRssiTicker();
-    s.connectedDevice = null;
-    s.connectedMac = null;
-    s.currentRssi = null;
-    _uiTick?.cancel();
-    s.enqueueSnack("Disconnected.");
-    widget.onChanged();
-  }
-
-  @override
-  void dispose() {
-    _uiTick?.cancel();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final s = widget.state;
-    final isConnected = s.connectedDevice != null;
-
-    return Padding(
-      padding: const EdgeInsets.all(16.0),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Card(
-            elevation: kCardElevation,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(kCardRadius)),
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Device Status', style: Theme.of(context).textTheme.titleLarge),
-                  const SizedBox(height: 12),
-                  if (isConnected)
-                    Column(
-                      children: [
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Chip(
-                              avatar: const Icon(Icons.bluetooth_connected, color: Colors.blue),
-                              label: const Text("Connected"),
-                              backgroundColor: Colors.blue.withOpacity(0.1),
-                              side: BorderSide.none,
-                            ),
-                            _rssiChip(s.currentRssi),
-                          ],
-                        ),
-                        const SizedBox(height: 12),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  s.connectedDevice ?? "",
-                                  style: Theme.of(context).textTheme.titleMedium,
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  s.connectedMac ?? "",
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodySmall
-                                      ?.copyWith(color: Colors.grey[600]),
-                                ),
-                              ],
-                            ),
-                            OutlinedButton.icon(
-                              onPressed: _disconnect,
-                              icon: const Icon(Icons.bluetooth_disabled),
-                              label: const Text("Disconnect"),
-                              style: OutlinedButton.styleFrom(
-                                shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(kCardRadius)),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    )
-                  else
-                    Row(
-                      children: [
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            onPressed: _scanning ? null : _scan,
-                            icon: const Icon(Icons.radar),
-                            label: Text(_scanning ? "Scanning..." : "Scan for Devices"),
-                            style: ElevatedButton.styleFrom(
-                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                              shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(kCardRadius)),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 16),
-          Text('Available Devices', style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 8),
-          Expanded(
-            child: _found.isEmpty
-                ? Center(
-              child: Text(
-                _scanning
-                    ? "Discovering nearby BWD devices..."
-                    : "Tap 'Scan' to discover BWD devices.",
-                textAlign: TextAlign.center,
-              ),
-            )
-                : ListView.builder(
-              itemCount: _found.length,
-              itemBuilder: (_, i) {
-                final d = _found[i];
-                final isSelected = s.connectedMac == d.mac;
-                return Card(
-                  margin: const EdgeInsets.symmetric(vertical: 4),
-                  elevation: isSelected ? kCardElevation : 2,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(kCardRadius),
-                    side: isSelected
-                        ? const BorderSide(color: Colors.blue, width: 2)
-                        : BorderSide.none,
-                  ),
-                  child: ListTile(
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    leading: const CircleAvatar(
-                      backgroundColor: Colors.blueAccent,
-                      child: Icon(Icons.bluetooth, color: Colors.white),
-                    ),
-                    title: Text(d.name,
-                        style: TextStyle(
-                            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal)),
-                    subtitle: Text(d.mac),
-                    trailing: Chip(
-                      label: Text("${d.rssi} dBm"),
-                      backgroundColor: _getRssiColor(d.rssi).withOpacity(0.1),
-                      side: BorderSide.none,
-                    ),
-                    onTap: isSelected ? null : () => _connect(d),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _TrainingTab extends StatefulWidget {
-  final _UiState state;
-  final VoidCallback notify;
-  const _TrainingTab({required this.state, required this.notify});
-
-  @override
-  State<_TrainingTab> createState() => _TrainingTabState();
-}
-
-class _TrainingTabState extends State<_TrainingTab> with SingleTickerProviderStateMixin {
-  late AnimationController _pulseController;
-  late Animation<double> _pulseAnimation;
-
-  @override
-  void initState() {
-    super.initState();
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 800),
-    );
-    _pulseAnimation = CurvedAnimation(parent: _pulseController, curve: Curves.easeIn);
-  }
-
-  @override
-  void didUpdateWidget(covariant _TrainingTab oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.state.isTraining != oldWidget.state.isTraining) {
-      if (widget.state.isTraining) {
-        _pulseController.repeat(reverse: true);
-      } else {
-        _pulseController.stop();
-      }
-    }
-  }
-
-  @override
-  void dispose() {
-    _pulseController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final s = widget.state;
-    final isConnected = s.connectedDevice != null;
-    final scheme = Theme.of(context).colorScheme;
-    final canStart = isConnected && s.selectedTag != null && !s.isTraining;
-
-    return Padding(
-      padding: const EdgeInsets.all(16.0),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Card(
-            elevation: kCardElevation,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(kCardRadius)),
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Flexible(
-                        child: Text(
-                          'Training Session',
-                          style: Theme.of(context).textTheme.titleLarge,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      if (s.isTraining) ...[
-                        FadeTransition(
-                          opacity: _pulseAnimation,
-                          child: const Icon(Icons.circle, size: 8, color: Colors.red),
-                        ),
-                        const SizedBox(width: 6),
-                        Text("Recording", style: Theme.of(context).textTheme.labelSmall),
-                      ],
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Container(
-                    decoration: BoxDecoration(
-                      color: scheme.brightness == Brightness.dark
-                          ? scheme.surfaceVariant.withOpacity(0.22)
-                          : scheme.surfaceVariant.withOpacity(0.32),
-                      borderRadius: BorderRadius.circular(kCardRadius),
-                    ),
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.bluetooth_connected, color: Colors.blue, size: 16),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(isConnected ? s.connectedDevice! : "No device selected",
-                                  style: Theme.of(context).textTheme.bodyMedium,
-                                  overflow: TextOverflow.ellipsis),
-                              if (isConnected && s.connectedMac != null)
-                                Text(s.connectedMac!,
-                                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                                      color: scheme.onSurfaceVariant,
-                                      fontFeatures: const [FontFeature.tabularFigures()],
-                                    ),
-                                    overflow: TextOverflow.ellipsis),
-                            ],
-                          ),
-                        ),
-                        if (isConnected) _rssiChip(s.currentRssi),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  const Divider(height: 0, thickness: 0.6),
-                  const SizedBox(height: 12),
-                  Text('Training Tags', style: Theme.of(context).textTheme.titleMedium),
-                  const SizedBox(height: 8),
-                  if (!isConnected)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Text(
-                        'Connect a BWD device in the Connect tab to start training.',
-                        style: Theme.of(context)
-                            .textTheme
-                            .labelSmall
-                            ?.copyWith(fontStyle: FontStyle.italic),
-                      ),
-                    ),
-                  if (s.selectedTag == null && !s.isTraining)
-                    Text('Choose a tag to enable Start',
-                        style: Theme.of(context)
-                            .textTheme
-                            .labelSmall
-                            ?.copyWith(fontStyle: FontStyle.italic)),
-                  _TagSelector(
-                    selected: s.selectedTag,
-                    enabled: !s.isTraining,
-                    onSelected: (t) => setState(() => s.selectedTag = t),
-                  ),
-                  const SizedBox(height: 16),
-                  SizedBox(
-                    width: double.infinity,
-                    child: Tooltip(
-                      message: s.isTraining
-                          ? "End the current training session"
-                          : "Start the training session",
-                      child: FilledButton.icon(
-                        style: ButtonStyle(
-                          backgroundColor: MaterialStateProperty.resolveWith((states) {
-                            if (states.contains(MaterialState.disabled)) return null;
-                            return s.isTraining ? Colors.red.shade700 : Colors.green.shade700;
-                          }),
-                          shape: MaterialStateProperty.all(
-                            RoundedRectangleBorder(borderRadius: BorderRadius.circular(kCardRadius)),
-                          ),
-                          padding:
-                          MaterialStateProperty.all(const EdgeInsets.symmetric(vertical: 8)),
-                          minimumSize: MaterialStateProperty.all(const Size.fromHeight(44)),
-                        ),
-                        icon: Icon(
-                            s.isTraining ? Icons.stop_circle_outlined : Icons.play_circle_filled,
-                            size: 20),
-                        label: AnimatedSwitcher(
-                          duration: const Duration(milliseconds: 160),
-                          transitionBuilder: (c, a) => FadeTransition(opacity: a, child: c),
-                          child: Text(
-                            s.isTraining ? "End Training" : "Start Training",
-                            key: ValueKey(s.isTraining),
-                            style: const TextStyle(fontSize: 16),
-                          ),
-                        ),
-                        onPressed: (s.isTraining || canStart)
-                            ? () {
-                          HapticFeedback.selectionClick();
-                          if (!s.isTraining) {
-                            s.startTraining();
-                            s.enqueueSnack(
-                                '{"command":"startTraining","tag":"${s.selectedTag}"} sent');
-                          } else {
-                            _confirmEnd(context);
-                            return;
-                          }
-                          widget.notify();
-                        }
-                            : null,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 16),
-          Text('Live Event Stream', style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 8),
-          Expanded(
-            child: s.isTraining
-                ? _LiveEventList(state: s, notify: widget.notify)
-                : s.buffer.isEmpty
-                ? const Center(
-                child: Text("Live events will appear here once training starts."))
-                : _LiveEventList(state: s, notify: widget.notify),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _confirmEnd(BuildContext context) async {
-    final s = widget.state;
-    final snap = s.endTrainingAndBuildSession();
-
-    if (snap.count == 0) {
-      s.enqueueSnack("Session has no events. Discarded.");
-      s.discardTraining();
-      widget.notify();
-      return;
-    }
-
-    final res = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("End Training?"),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _kv("Tag", snap.tag),
-            _kv("Duration", "${snap.durationSec.toStringAsFixed(1)} s"),
-            _kv("Events", "${snap.count}"),
-            _kv("Avg RSSI", "${snap.avgRssi} dBm"),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, "discard"),
-            child: const Text("Discard"),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, "save"),
-            child: const Text("Save"),
-          ),
-        ],
-      ),
-    );
-
-    if (!mounted) return;
-
-    if (res == "save") {
-      await _openReviewSheet(context, snap);
-    } else if (res == "discard") {
-      s.discardTraining();
-      s.enqueueSnack('{"command":"endTrain","flag": false} sent · Training discarded');
-      widget.notify();
-    }
-  }
-
-  Future<void> _openReviewSheet(BuildContext context, TrainingSession session) async {
-    final s = widget.state;
-    bool submitEnabled = false;
-    bool isSubmitting = false;
-    bool armed = false;
-
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      showDragHandle: true,
-      builder: (ctx) {
-        final preview = session.toPreviewJson();
-        final pretty = const JsonEncoder.withIndent('  ').convert(preview);
-        final messenger = ScaffoldMessenger.of(context);
-        final h = MediaQuery.of(ctx).size.height;
-        final viewInsets = MediaQuery.of(ctx).viewInsets.bottom;
-        final ScrollController scrollController = ScrollController();
-
-        return Padding(
-          padding: EdgeInsets.only(left: 16, right: 16, bottom: max(16, viewInsets)),
-          child: StatefulBuilder(
-            builder: (ctx2, setState) {
-              if (!armed) {
-                armed = true;
-                Timer(const Duration(milliseconds: 1200), () {
-                  if (Navigator.of(ctx2).canPop() && !submitEnabled) {
-                    setState(() => submitEnabled = true);
-                  }
-                });
-              }
-
-              return FractionallySizedBox(
-                heightFactor: 0.92,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.only(top: 16, bottom: 8),
-                      child: Text("Review & Submit",
-                          style: Theme.of(ctx2).textTheme.titleLarge,
-                          overflow: TextOverflow.ellipsis),
-                    ),
-                    Expanded(
-                      child: ListView(
-                        controller: scrollController,
-                        padding: EdgeInsets.zero,
-                        children: [
-                          Text("Session Summary", style: Theme.of(ctx2).textTheme.titleMedium),
-                          const SizedBox(height: 8),
-                          _kv("Device", session.device),
-                          _kv("Tag", session.tag),
-                          _kv("Events", "${session.count}"),
-                          _kv("Duration", "${session.durationSec.toStringAsFixed(1)} s"),
-                          _kv("RSSI",
-                              "avg ${session.avgRssi} dBm (min ${session.minRssi} / max ${session.maxRssi})"),
-                          const SizedBox(height: 12),
-                          Text("JSON Preview", style: Theme.of(ctx2).textTheme.titleMedium),
-                          const SizedBox(height: 8),
-                          Container(
-                            constraints: BoxConstraints(
-                              maxHeight: h * 0.40,
-                            ),
-                            width: double.infinity,
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              border: Border.all(color: Theme.of(ctx2).dividerColor),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: SingleChildScrollView(
-                              child: Text(
-                                pretty,
-                                style: const TextStyle(fontFamily: 'monospace'),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                        ],
-                      ),
-                    ),
-                    SafeArea(
-                      top: false,
-                      child: Row(
-                        children: [
-                          OutlinedButton.icon(
-                            icon: const Icon(Icons.copy_all),
-                            label: const Text("Copy JSON"),
-                            onPressed: isSubmitting
-                                ? null
-                                : () async {
-                              await Clipboard.setData(ClipboardData(text: pretty));
-                              if (mounted) {
-                                messenger.clearSnackBars();
-                                messenger.showSnackBar(
-                                  const SnackBar(content: Text("JSON copied")),
-                                );
-                              }
-                            },
-                          ),
-                          const Spacer(),
-                          FilledButton.icon(
-                            icon: const Icon(Icons.send),
-                            label: isSubmitting ? const Text("Submitting...") : const Text("Submit"),
-                            onPressed: (submitEnabled && !isSubmitting)
-                                ? () async {
-                              HapticFeedback.selectionClick();
-                              setState(() => isSubmitting = true);
-                              // TODO: Replace with a real network call to the /train endpoint.
-                              // Handle success and error cases.
-                              await Future.delayed(const Duration(milliseconds: 1600));
-                              if (!mounted) return;
-                              s.history.insert(0, session);
-                              s.discardTraining();
-                              s.enqueueSnack(
-                                  '{"command":"endTrain","flag": true} sent · Session submitted');
-                              Navigator.pop(ctx);
-                              widget.notify();
-                            }
-                                : null,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              );
-            },
-          ),
-        );
-      },
-    );
-  }
-}
-
 class _HistoryTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback notify;
@@ -1139,18 +2079,16 @@ class _HistoryTab extends StatefulWidget {
 class _HistoryTabState extends State<_HistoryTab> {
   int _page = 1;
   static const _per = 5;
-
   @override
   Widget build(BuildContext context) {
     final s = widget.state;
     final total = s.history.length;
     final pages = (total / _per).ceil().clamp(1, 999);
     final start = (_page - 1) * _per;
-    final end = min(start + _per, total);
+    final end = math.min(start + _per, total);
     final view = s.history.sublist(start, end);
     final fmt = DateFormat('yyyy-MM-dd HH:mm');
     final messenger = ScaffoldMessenger.of(context);
-
     return Padding(
       padding: const EdgeInsets.all(16.0),
       child: Column(
@@ -1160,7 +2098,8 @@ class _HistoryTabState extends State<_HistoryTab> {
           const SizedBox(height: 16),
           if (total == 0)
             const Expanded(
-                child: Center(child: Text("No sessions yet. Save one from Training.")))
+                child: Center(
+                    child: Text("No sessions yet. Save one from Training.")))
           else
             Expanded(
               child: ListView.builder(
@@ -1170,7 +2109,8 @@ class _HistoryTabState extends State<_HistoryTab> {
                   return Card(
                     margin: const EdgeInsets.symmetric(vertical: 8),
                     elevation: kCardElevation,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(kCardRadius)),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(kCardRadius)),
                     child: Padding(
                       padding: const EdgeInsets.all(16.0),
                       child: Column(
@@ -1178,7 +2118,8 @@ class _HistoryTabState extends State<_HistoryTab> {
                         children: [
                           Row(
                             children: [
-                              Text(sess.tag, style: Theme.of(context).textTheme.titleMedium),
+                              Text(sess.tag,
+                                  style: Theme.of(context).textTheme.titleMedium),
                               const Spacer(),
                               Text("Created: ${fmt.format(sess.endedAt)}",
                                   style: Theme.of(context).textTheme.bodySmall),
@@ -1197,11 +2138,13 @@ class _HistoryTabState extends State<_HistoryTab> {
                                 side: BorderSide.none,
                               ),
                               Chip(
-                                label: Text("Duration: ${sess.durationSec.toStringAsFixed(1)}s"),
+                                label: Text(
+                                    "Duration: ${sess.durationSec.toStringAsFixed(1)}s"),
                                 side: BorderSide.none,
                               ),
                               Chip(
-                                label: Text("Avg RSSI: ${sess.avgRssi} dBm"),
+                                label: Text(
+                                    "Avg RSSI: ${sess.avgRssi.toStringAsFixed(1)} dBm"),
                                 side: BorderSide.none,
                               ),
                             ],
@@ -1213,7 +2156,7 @@ class _HistoryTabState extends State<_HistoryTab> {
                                 icon: const Icon(Icons.visibility),
                                 label: const Text("Preview JSON"),
                                 onPressed: () {
-                                  final pretty = const JsonEncoder.withIndent('  ')
+                                  final pretty = const JsonEncoder.withIndent(' ')
                                       .convert(sess.toPreviewJson());
                                   showModalBottomSheet(
                                     context: context,
@@ -1221,31 +2164,39 @@ class _HistoryTabState extends State<_HistoryTab> {
                                     useSafeArea: true,
                                     showDragHandle: true,
                                     builder: (ctx) {
-                                      final ScrollController scrollController = ScrollController();
+                                      final ScrollController scrollController =
+                                      ScrollController();
                                       return Padding(
                                         padding: const EdgeInsets.all(16),
                                         child: FractionallySizedBox(
                                           heightFactor: 0.9,
                                           child: Column(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            crossAxisAlignment:
+                                            CrossAxisAlignment.start,
                                             children: [
                                               Text("JSON Preview",
-                                                  style: Theme.of(ctx).textTheme.titleLarge),
+                                                  style: Theme.of(ctx)
+                                                      .textTheme
+                                                      .titleLarge),
                                               const SizedBox(height: 12),
                                               Expanded(
                                                 child: Container(
                                                   width: double.infinity,
-                                                  padding: const EdgeInsets.all(12),
+                                                  padding:
+                                                  const EdgeInsets.all(12),
                                                   decoration: BoxDecoration(
                                                     border: Border.all(
-                                                        color: Theme.of(ctx).dividerColor),
-                                                    borderRadius: BorderRadius.circular(8),
+                                                        color: Theme.of(ctx)
+                                                            .dividerColor),
+                                                    borderRadius:
+                                                    BorderRadius.circular(8),
                                                   ),
                                                   child: SingleChildScrollView(
                                                     controller: scrollController,
                                                     child: Text(pretty,
                                                         style: const TextStyle(
-                                                            fontFamily: 'monospace')),
+                                                            fontFamily:
+                                                            'monospace')),
                                                   ),
                                                 ),
                                               ),
@@ -1255,19 +2206,24 @@ class _HistoryTabState extends State<_HistoryTab> {
                                                 child: Row(
                                                   children: [
                                                     OutlinedButton.icon(
-                                                      icon: const Icon(Icons.copy_all),
+                                                      icon:
+                                                      const Icon(Icons.copy_all),
                                                       label: const Text("Copy JSON"),
                                                       onPressed: () async {
                                                         await Clipboard.setData(
-                                                            ClipboardData(text: pretty));
+                                                            ClipboardData(
+                                                                text: pretty));
                                                         messenger.clearSnackBars();
-                                                        messenger.showSnackBar(const SnackBar(
-                                                            content: Text("JSON copied")));
+                                                        messenger.showSnackBar(
+                                                            const SnackBar(
+                                                                content: Text(
+                                                                    "JSON copied")));
                                                       },
                                                     ),
                                                     const Spacer(),
                                                     FilledButton(
-                                                      onPressed: () => Navigator.pop(ctx),
+                                                      onPressed: () =>
+                                                          Navigator.pop(ctx),
                                                       child: const Text("Close"),
                                                     ),
                                                   ],
@@ -1289,12 +2245,12 @@ class _HistoryTabState extends State<_HistoryTab> {
                                   final removed = s.history.removeAt(start + i);
                                   final oldPage = _page;
                                   setState(() {
-                                    final newPages =
-                                    (s.history.length / _per).ceil().clamp(1, 999);
+                                    final newPages = (s.history.length / _per)
+                                        .ceil()
+                                        .clamp(1, 999);
                                     if (_page > newPages) _page = newPages;
                                   });
                                   widget.notify();
-
                                   messenger.showSnackBar(
                                     SnackBar(
                                       content: const Text('Session deleted'),
