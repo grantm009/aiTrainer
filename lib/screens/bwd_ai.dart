@@ -17,8 +17,6 @@ import 'package:http_parser/http_parser.dart';
 import 'package:flutter/foundation.dart'; // for debugPrint
 import 'package:collection/collection.dart'; // For assertions
 
-// === STEP 1: STANDARDIZE ALL KEY NAMES ===
-// Add a constant class to prevent typos and standardize all key names.
 class IngestKeys {
   static const sessionId = 'sessionId';
   static const deviceMac = 'deviceMac';
@@ -34,8 +32,6 @@ class IngestKeys {
   static const appVersion = 'appVersion';
   static const firmwareVersion = 'firmwareVersion';
 }
-
-// === SHARED HELPERS (TOP-LEVEL) ===
 String _apiTagFor(String tag) {
   switch (tag) {
     case "baseline":
@@ -100,7 +96,6 @@ Future<bool> _uploadCsvToEdgeImpulse({
   return ok;
 }
 
-/// NEW: A more robust payload validator with actionable error messages.
 bool _validateIngestionPayload(Map<String, dynamic> p, {void Function(String)? onError}) {
   bool err(String m) {
     onError?.call(m);
@@ -127,9 +122,6 @@ bool _validateIngestionPayload(Map<String, dynamic> p, {void Function(String)? o
   }
   return true;
 }
-
-// === HELPER FUNCTIONS FOR ROBUST PARSING AND CLAMPING ===
-/// NEW: Safely parses a value into a number, handling potential type mismatches.
 T _num<T extends num>(Object? v, T fallback) {
   if (v is num) return (T == int ? v.toInt() : v.toDouble()) as T;
   if (v is String) {
@@ -138,45 +130,30 @@ T _num<T extends num>(Object? v, T fallback) {
   }
   return fallback;
 }
-
-/// NEW: Clamps the timestamp to a non-negative value.
 double _clampTs(double ts) {
   if (ts.isNaN || ts.isInfinite || ts < 0) return 0.0;
   return ts;
 }
-
-/// NEW: Clamps the RSSI value to a reasonable range (-127 to 20).
 int _clampRssi(int r) {
   if (r < -127) return -127;
   if (r > 20) return 20;
   return r;
 }
-
-/// NEW: Clamps RSSI as double in a reasonable range (-127.0 to 20.0).
 double _clampRssiDouble(double r) {
   if (r < -127.0) return -127.0;
   if (r > 20.0) return 20.0;
   return r;
 }
-
-/// Clamps a value to be either 0 or 1, and casts it to an int.
 int _clampi01(num v) {
   final clamped = v.clamp(0, 1);
   return clamped.toInt();
 }
-
-/// (Optional) CSV safety function to handle special characters.
 String _csvEscape(Object? v) {
   final s = '$v';
   return (s.contains(',') || s.contains('\n') || s.contains('"'))
       ? '"${s.replaceAll('"', '""')}"'
       : s;
 }
-
-// === IMPORTANT FOR AI DEVELOPER: DATA MODELS ===
-/// Represents a single data packet received from the BWD device.
-/// This is the core unit of information for the AI model.
-/// The `toJson()` method ensures the output format matches the server's needs.
 class Event {
   final double ts;
   final double rssi;
@@ -192,9 +169,6 @@ class Event {
     required this.ignitionStatus,
     required this.note,
   });
-
-  // === STEP 2: FIX Event.toJson() FOR INGESTION JSON ===
-  // Use IngestKeys constants and remove the meta object.
   Map<String, dynamic> toJson() => {
     IngestKeys.timestamp: double.parse(ts.toStringAsFixed(1)),
     // seconds, 0.1 precision
@@ -203,26 +177,15 @@ class Event {
     IngestKeys.doorStatus: doorStatus,
     IngestKeys.ignitionStatus: ignitionStatus,
   };
-
-  // === STEP 6: FIX CSV EXPORT FOR EDGE IMPULSE ===
-  // New method for CSV-friendly data row
   Map<String, dynamic> toCsvRow(String label) => {
     "timestamp": (ts * 1000).round(),
-    // ms
     "rssi": rssi.toStringAsFixed(1),
     "handbrake": handBrakeStatus,
-    // Rename handBrakeStatus -> handbrake
     "ignition": ignitionStatus,
-    // Rename ignitionStatus -> ignition
     "door": doorStatus,
-    // Rename doorStatus -> door
     "label": label,
-    // Add the label column
   };
 }
-
-/// Represents a full AI training session. This is the object that will be
-/// converted to a JSON payload and sent to the server.
 class TrainingSession {
   final String id;
   final String tag;
@@ -244,8 +207,6 @@ class TrainingSession {
       events.isEmpty ? 0 : events.map((e) => e.rssi).reduce((a, b) => a + b) / events.length;
   double get minRssi => events.isEmpty ? 0 : events.map((e) => e.rssi).reduce(math.min);
   double get maxRssi => events.isEmpty ? 0 : events.map((e) => e.rssi).reduce(math.max);
-
-  /// This method is for UI preview only and will not be sent to the server.
   Map<String, dynamic> toPreviewJson() => {
     "start": {"command": "startTraining", "tag": tag, "device": device},
     "stream": events.take(math.min(40, events.length)).map((e) => e.toJson()).toList(),
