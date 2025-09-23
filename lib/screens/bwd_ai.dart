@@ -1,4 +1,3 @@
-// All new imports needed for BLE, permissions, and HTTP
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -12,11 +11,9 @@ import 'package:permission_handler/permission_handler.dart';
 import 'dart:ui' show FontFeature;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
-// New import for Edge Impulse upload helpers
 import 'package:http_parser/http_parser.dart';
-import 'package:flutter/foundation.dart'; // for debugPrint
-import 'package:collection/collection.dart'; // For assertions
-
+import 'package:flutter/foundation.dart';
+import 'package:collection/collection.dart';
 class IngestKeys {
   static const sessionId = 'sessionId';
   static const deviceMac = 'deviceMac';
@@ -40,7 +37,6 @@ String _apiTagFor(String tag) {
       return tag;
   }
 }
-
 Future<bool> _uploadEiJson({
   required Map<String, dynamic> eiJson,
   required String apiKey,
@@ -65,7 +61,6 @@ Future<bool> _uploadEiJson({
   }
   return ok;
 }
-
 Future<bool> _uploadCsvToEdgeImpulse({
   required String csvPath,
   required String apiKey,
@@ -171,7 +166,6 @@ class Event {
   });
   Map<String, dynamic> toJson() => {
     IngestKeys.timestamp: double.parse(ts.toStringAsFixed(1)),
-    // seconds, 0.1 precision
     IngestKeys.rssi: double.parse(rssi.toStringAsFixed(1)),
     IngestKeys.handBrakeStatus: handBrakeStatus,
     IngestKeys.doorStatus: doorStatus,
@@ -219,8 +213,6 @@ class TrainingSession {
       "maxRssi": double.parse(maxRssi.toStringAsFixed(1)),
     }
   };
-
-  // === STEP 3: FIX TrainingSession.toIngestionJson() (TOP-LEVEL FIELDS) ===
   Map<String, dynamic> toIngestionJson({
     required String deviceMac,
     String? appVersion,
@@ -231,7 +223,6 @@ class TrainingSession {
         IngestKeys.sessionId: id,
         IngestKeys.deviceMac: deviceMac,
         IngestKeys.tag: tag,
-        // This will be overwritten by the API tag
         IngestKeys.startedAt: startedAt.toUtc().toIso8601String(),
         IngestKeys.endedAt: endedAt.toUtc().toIso8601String(),
         if (appVersion != null) IngestKeys.appVersion: appVersion,
@@ -247,8 +238,6 @@ class TrainingSession {
             "maxRssi": double.parse(maxRssi.toStringAsFixed(1)),
           }
       };
-
-  /// NEW: Generates a JSON payload in the Edge Impulse ingestion format.
   Map<String, dynamic> toEdgeImpulseIngestionJson() {
     final values = <List<double>>[];
     int lastMs = -999;
@@ -268,8 +257,8 @@ class TrainingSession {
     }
     return {
       "protected": {
-        "ver": "v1", // FIXED: Add the required version field
-        "alg": "none" // FIXED: Add the required algorithm field
+        "ver": "v1",
+        "alg": "none"
       },
       "signature": "UNSIGNED",
       "payload": {
@@ -286,8 +275,6 @@ class TrainingSession {
     };
   }
 
-  // === STEP 6: FIX CSV EXPORT FOR EDGE IMPULSE ===
-  // NEW: public getter from step 3 in the prompt
   String get eiLabel {
     switch (tag) {
       case "approach":
@@ -310,10 +297,10 @@ class TrainingSession {
   }
 
   List<Map<String, dynamic>> toCsvData() {
-    final correctedTag = eiLabel; // Use the public getter
+    final correctedTag = eiLabel;
     final List<Event> sampledEvents = [];
     int lastMs = -999;
-    for (final e in events) {
+    for (final e in sortedByTimestamp().events) {
       final ms = (e.ts * 1000).round();
       if (ms - lastMs >= 500) {
         // enforce 2 Hz
@@ -324,9 +311,6 @@ class TrainingSession {
     return sampledEvents.map((e) => e.toCsvRow(correctedTag)).toList();
   }
 }
-
-// === STEP 5: SORT EVENTS BEFORE SUBMIT ===
-// Add a new extension method to TrainingSession.
 extension TrainingSessionSorting on TrainingSession {
   TrainingSession sortedByTimestamp() {
     final sorted = List<Event>.from(events)..sort((a, b) => a.ts.compareTo(b.ts));
@@ -351,15 +335,14 @@ class _UiState {
   bool isTraining = false;
   String? selectedTag;
   DateTime? trainingStartReal;
-// This is the buffer that holds the live-streamed data.
   final List<Event> buffer = [];
   final List<TrainingSession> history = [];
   final List<String> _snack = [];
   final int _bufferCap = 50000;
-// NEW: Buffer for fragmented JSON packets
   String _notifyBuf = "";
-// FIX B: New flag to signal a pending endTrain command
   bool pendingEndTrain = false;
+  bool eiUploadToTesting = false;
+
   void enqueueSnack(String m) => _snack.add(m);
   String? takeSnack() => _snack.isEmpty ? null : _snack.removeAt(0);
   void discardTraining() {
@@ -367,14 +350,10 @@ class _UiState {
     buffer.clear();
   }
 }
-
-// === CONSTANTS DEFINED HERE ===
 const bool kDemoMode = bool.fromEnvironment('DEMO', defaultValue: true);
 const String kServerUrl = kDemoMode
-    ? "https://httpbin.org/post" // echoes your payload back
+    ? "https://httpbin.org/post"
     : "https://your.api.endpoint/train";
-// FIX 3: Replaces 'baseline' with 'inside' to align with the AI model's taxonomy
-// The 'baseline' tag is still used internally but is mapped to 'inside' for the AI model.
 const _tags = [
   "approach",
   "enter",
@@ -387,18 +366,14 @@ const _tags = [
 const kCardRadius = 12.0;
 const kCardElevation = 4.0;
 const Duration kStreamTimeout = Duration(seconds: 7);
-// === STEP 8: CONFIGURE SERVER URL ===
 const String kBwdServiceUuid = "fecdcb88-8e90-11ee-b9d1-0242ac120002";
 const String kBwdRssiCharUuid = "fecdce67-8e90-11ee-b9d1-0242ac120002";
-// NOTE: This UUID is intentionally different from others, as confirmed by the firmware team.
 const String kBwdCtrlCharUuid = "fecdce99-8e90-11ee-b9d1-02123c1a000a";
 const String kBwdStateCharUuid = "fecdce68-8e90-11ee-b9d1-0242ac120002";
-// Re-using helper functions
 String _fakeMac(math.Random r) {
   String two() => r.nextInt(256).toRadixString(16).padLeft(2, '0').toUpperCase();
   return "D1:9A:${two()}:${two()}:${two()}:${two()}";
 }
-
 class _TagSelector extends StatelessWidget {
   final String? selected;
   final bool enabled;
@@ -410,22 +385,25 @@ class _TagSelector extends StatelessWidget {
   });
   @override
   Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: _tags.map((t) {
-        final isSel = t == selected;
-        return ChoiceChip(
-          label: Text(t),
-          selected: isSel,
-          onSelected: enabled ? (_) => onSelected(t) : null,
-        );
-      }).toList(),
+    return SizedBox(
+      height: 48,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: _tags.length,
+        itemBuilder: (_, i) {
+          final t = _tags[i];
+          final isSel = t == selected;
+          return ChoiceChip(
+            label: Text(t),
+            selected: isSel,
+            onSelected: enabled ? (_) => onSelected(t) : null,
+          );
+        },
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+      ),
     );
   }
 }
-
-// The main application widget
 class BwdAi extends StatefulWidget {
   const BwdAi({super.key});
   @override
@@ -435,26 +413,22 @@ class BwdAi extends StatefulWidget {
 class _BwdAiState extends State<BwdAi> {
   int _tab = 0;
   late final _UiState state;
-// New BLE-related state variables from gauge_screen.dart
   final List<ScanResult> _devices = [];
   StreamSubscription<List<ScanResult>>? _scanSub;
   BluetoothDevice? _connectedDevice;
   StreamSubscription<BluetoothConnectionState>? _connSub;
   BluetoothCharacteristic? _ctrlChar;
-  BluetoothCharacteristic? _rssiChar; // Renamed to _rssiChar for clarity
+  BluetoothCharacteristic? _rssiChar;
   StreamSubscription<List<int>>? _notifySub;
   Timer? _streamWatchdog;
   StreamSubscription<BluetoothAdapterState>? _adapterStateSub;
-// NEW: Variables to capture firmware version and state characteristic.
   BluetoothCharacteristic? _stateChar;
   String? _cachedFwVersion;
-// New variables for the reconnection loop
   Timer? _reconnectTimer;
   int _retries = 0;
   BluetoothDevice? _lastDevice;
   final _rng = math.Random();
-
-  // New timer for demo mode streaming
+  Timer? _listRebuildThrottle;
   Timer? _demoTimer;
   double _demoTime = 0.0;
 
@@ -473,6 +447,8 @@ class _BwdAiState extends State<BwdAi> {
     _scanSub = null;
     _adapterStateSub?.cancel();
     _adapterStateSub = null;
+    _listRebuildThrottle?.cancel();
+    _listRebuildThrottle = null;
     FlutterBluePlus.stopScan().catchError((_) {});
     super.dispose();
   }
@@ -527,8 +503,6 @@ class _BwdAiState extends State<BwdAi> {
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
       for (final r in results) {
         final name = r.advertisementData.advName;
-        // FIX: Replaced .str with .toString() for better compatibility
-        // FIX: Make the UUID check case-insensitive for robustness
         final hasBwdSvc = r.advertisementData.serviceUuids
             .map((u) => u.toString().toLowerCase())
             .contains(kBwdServiceUuid.toLowerCase());
@@ -586,7 +560,6 @@ class _BwdAiState extends State<BwdAi> {
             .connect(timeout: const Duration(seconds: 10), autoConnect: false);
         _retries = 0;
         _connectedDevice = _lastDevice;
-// FIX: Replaced .str with .toString()
         state.connectedDevice =
             _lastDevice?.platformName ?? _lastDevice?.remoteId.toString();
         state.connectedMac = _lastDevice?.remoteId.toString();
@@ -602,20 +575,16 @@ class _BwdAiState extends State<BwdAi> {
   Future<void> _connectToDevice(BluetoothDevice d) async {
     _teardownConnection();
     _lastDevice = d;
-// ensure scanning is stopped before connecting
     try {
       await FlutterBluePlus.stopScan();
     } catch (_) {}
     await _scanSub?.cancel();
     _scanSub = null;
-// prefer platformName when connected
-// FIX: Replaced .str with .toString()
     final displayName =
     d.platformName?.isNotEmpty == true ? d.platformName : d.remoteId.toString();
     state.enqueueSnack("Connecting to $displayName...");
     try {
       await d.connect(timeout: const Duration(seconds: 10), autoConnect: false);
-// NEW: Request a larger MTU on Android to reduce packet fragmentation
       if (Platform.isAndroid) {
         try {
           await d.requestMtu(247);
@@ -639,7 +608,6 @@ class _BwdAiState extends State<BwdAi> {
         }
       });
       await _discoverServices();
-      // Add a quick if (!mounted) return; after await in _connectToDevice right before setState
       if (!mounted) return;
       setState(() {});
     } catch (e) {
@@ -648,15 +616,11 @@ class _BwdAiState extends State<BwdAi> {
       _beginAutoReconnect();
     }
   }
-
-  /// PATCH: Now captures the firmware version and sets the _stateChar handle.
   Future<void> _discoverServices() async {
     if (_connectedDevice == null) return;
     try {
       final services = await _connectedDevice!.discoverServices();
-// Bind from the BWD service only (safer)
       final bwdSvc = services.firstWhere(
-        // FIX: Make this UUID check case-insensitive too for robustness
             (svc) => svc.uuid.toString().toLowerCase() == kBwdServiceUuid.toLowerCase(),
         orElse: () => throw 'BWD service not found',
       );
@@ -664,11 +628,9 @@ class _BwdAiState extends State<BwdAi> {
         final id = c.uuid.toString().toLowerCase();
         if (id == kBwdCtrlCharUuid.toLowerCase()) _ctrlChar = c;
         if (id == kBwdRssiCharUuid.toLowerCase()) _rssiChar = c;
-// NEW: Get the characteristic for the firmware version
         if (id == kBwdStateCharUuid.toLowerCase()) _stateChar = c;
       }
       state.enqueueSnack("Services discovered.");
-// NEW: Read the firmware version once and cache it.
       try {
         final raw = await _stateChar?.read();
         if (raw != null && raw.isNotEmpty) {
@@ -676,16 +638,13 @@ class _BwdAiState extends State<BwdAi> {
           state.enqueueSnack("Firmware Version: $_cachedFwVersion");
         }
       } catch (_) {
-// Ignore errors, it's an optional field
       }
-      // If we dropped mid-session, make sure device state is cleared
       if (state.pendingEndTrain && _ctrlChar != null) {
         try {
           await _sendEndTraining(false);
         } catch (_) {}
         state.pendingEndTrain = false;
       }
-      // Add a quick if (!mounted) return; in _discoverServices when calling setState()
       if (!mounted) return;
       setState(() {});
     } catch (e) {
@@ -716,9 +675,6 @@ class _BwdAiState extends State<BwdAi> {
     });
   }
 
-// === NEW TRAINING METHODS FOR AI DEVELOPER'S NEEDS ===
-  /// Sends the "startTraining" command to the BWD device.
-  /// The device will then begin streaming training packets.
   Future<void> _sendStartTraining(String tag) async {
     if (kDemoMode) {
       state.isTraining = true;
@@ -757,8 +713,6 @@ class _BwdAiState extends State<BwdAi> {
     await _safeWrite(_ctrlChar!, utf8.encode(payload));
     _subscribeTraining();
   }
-
-  /// PATCH: Now also disables notifications on the characteristic and resets the UI state immediately.
   Future<void> _sendEndTraining(bool save) async {
     if (kDemoMode) {
       _demoTimer?.cancel();
@@ -776,25 +730,20 @@ class _BwdAiState extends State<BwdAi> {
     await Future.delayed(const Duration(milliseconds: 200)); // allow tail packets
     try {
       await _rssiChar?.setNotifyValue(false);
-    } catch (_) {} // NEW: Disable notifications on the BLE device
+    } catch (_) {}
     await _notifySub?.cancel();
     _notifySub = null;
-    _streamWatchdog?.cancel(); // Cancel watchdog immediately
+    _streamWatchdog?.cancel();
     _streamWatchdog = null;
     state.isTraining = false;
-// NEW: Clear the line buffer to prevent stale data on the next session
     state._notifyBuf = "";
     if (mounted) setState(() {});
   }
-
-  /// Subscribes to the characteristic that streams the training data.
-  /// This is where the real-time data flow begins.
   Future<void> _subscribeTraining() async {
     if (_rssiChar == null) {
       state.enqueueSnack('Training stream characteristic not found.');
       return;
     }
-// NEW: Clear the buffer at the beginning of a new session
     state._notifyBuf = "";
     bool ok = false;
     try {
@@ -805,27 +754,21 @@ class _BwdAiState extends State<BwdAi> {
     }
     if (!ok) return;
     _notifySub?.cancel();
-// This listener handles the incoming streamed data and buffers it.
     _notifySub = _rssiChar!.value.listen(_handleTrainingNotify);
     state.isTraining = true;
     state.buffer.clear();
     _kickStreamWatchdog();
     setState(() {});
   }
-
-  /// FIX: Replaces the simple newline parser with a more robust one that handles
-  /// both newline-delimited and brace-balanced JSON.
   void _handleTrainingNotify(List<int> bytes) {
     _kickStreamWatchdog();
     state._notifyBuf += utf8.decode(bytes);
-// First try newline framing
     int nl;
     while ((nl = state._notifyBuf.indexOf('\n')) != -1) {
       final line = state._notifyBuf.substring(0, nl).trim();
       state._notifyBuf = state._notifyBuf.substring(nl + 1);
       if (line.isNotEmpty) _parseEventLine(line);
     }
-// Fallback: brace-balanced parse if no newlines
     int depth = 0, start = -1;
     for (int i = 0; i < state._notifyBuf.length; i++) {
       final ch = state._notifyBuf[i];
@@ -843,8 +786,6 @@ class _BwdAiState extends State<BwdAi> {
       }
     }
   }
-
-  // FIXED: The _parseEventLine method is now correctly a member of _BwdAiState
   void _parseEventLine(String line) {
     try {
       final Map<String, dynamic> p = json.decode(line);
@@ -853,9 +794,7 @@ class _BwdAiState extends State<BwdAi> {
           : (p.containsKey('RSSI') ? p['RSSI'] : -127);
       final event = Event(
         ts: _clampTs(_num<double>(p['timestamp'], 0.0)),
-        // Accepts both int and float; rounds once
         rssi: _clampRssiDouble(_num<double>(rssiSrc, -127.0)),
-        // If firmware ever sends lowercase, add a synonym read
         handBrakeStatus: _clampi01(_num<int>(
             p.containsKey('handBrakeStatus') ? p['handBrakeStatus'] : p['handbrake'], 0)),
         doorStatus: _clampi01(_num<int>(
@@ -869,19 +808,22 @@ class _BwdAiState extends State<BwdAi> {
       if (last != null && event.ts < last) {
         state.enqueueSnack("Warning: Out-of-order packet received (kept).");
       }
-      setState(() {
-        if (state.buffer.length >= state._bufferCap) {
-          state.buffer.removeAt(0);
-        }
-        state.currentRssi = event.rssi.round();
-        state.buffer.add(event);
-      });
+      state.buffer.add(event);
+      state.currentRssi = event.rssi.round();
+      _requestLiveListRebuild();
     } catch (e) {
       state.enqueueSnack("Failed to parse training data: $e");
     }
   }
 
-  // A super-light retry on transient 5xx
+  void _requestLiveListRebuild() {
+    if (!mounted) return;
+    if (_listRebuildThrottle != null) return;
+    _listRebuildThrottle = Timer(const Duration(milliseconds: 100), () {
+      if (mounted) setState(() {});
+      _listRebuildThrottle = null;
+    });
+  }
   Future<http.Response> _postWithRetry(Uri uri, {required Map<String,String> headers, required String body}) async {
     int attempt = 0;
     while (true) {
@@ -895,55 +837,38 @@ class _BwdAiState extends State<BwdAi> {
       attempt++;
     }
   }
-
-  /// This function is responsible for sending the buffered data to the AI developer's server.
-  /// It now uses the new, ingestion-friendly payload.
   Future<bool> _submitSession(TrainingSession session) async {
-    // --- DEMO: simulate a successful submit so the flow + History work ---
     if (kDemoMode) {
       await Future.delayed(const Duration(milliseconds: 300));
       state.enqueueSnack("Demo: submit simulated ✅ (not sent to server)");
-      return true; // <-- allows History insert + sheet to close
+      return true;
     }
-
-// NEW: Block submission if device MAC is missing.
     if ((state.connectedMac ?? "").isEmpty) {
       state.enqueueSnack("Device MAC missing. Please reconnect and try again.");
       return false;
     }
-// NEW: Basic validation to prevent submission of invalid sessions
     if (session.tag.isEmpty || session.count == 0 || session.durationSec <= 0) {
       state.enqueueSnack("Nothing to submit (tag/events/duration invalid).");
       return false;
     }
-// PATCH: Add submission size guard as a sanity check.
     if (session.count > 10000) {
       state.enqueueSnack(
           "Large session (${session.count} events). Consider splitting.");
-// You can decide to return false here if the payload is too large for your backend
     }
-// PATCH 4: Guard against placeholder URL
     if (kServerUrl.isEmpty ||
         kServerUrl.contains('your.api.endpoint') ||
         kServerUrl.contains('<your-backend>')) {
       state.enqueueSnack("Server URL not configured. Submissions blocked.");
       return false;
     }
-
-// === STEP 5: SORT EVENTS BEFORE SUBMIT ===
     final sorted = session.sortedByTimestamp();
-// === STEP 9: ADD A PAYLOAD VALIDATOR ===
     final payload = sorted.toIngestionJson(
-      deviceMac: state.connectedMac ?? "UNKNOWN", // NEW: Provide the raw MAC
-      appVersion: "1.0.0", // New field as requested
-      firmwareVersion: _cachedFwVersion, // New optional field
-      includeMeta: false, // Force this to false to ensure a flat payload
+      deviceMac: state.connectedMac ?? "UNKNOWN",
+      appVersion: "1.0.0",
+      firmwareVersion: _cachedFwVersion,
+      includeMeta: false,
     );
-
-    // FIX: Apply the API tag mapping here
     payload[IngestKeys.tag] = _apiTagFor(sorted.tag);
-
-    // Tiny hardening nit: assert that CSV headers are stable in debug mode.
     assert(
     const DeepCollectionEquality().equals(
       (payload[IngestKeys.events] as List).first.keys.toSet(),
@@ -962,7 +887,6 @@ class _BwdAiState extends State<BwdAi> {
       state.enqueueSnack("Payload validation failed!");
       return false;
     }
-
     try {
       final uri = Uri.parse(kServerUrl);
       final res = await _postWithRetry(
@@ -970,7 +894,6 @@ class _BwdAiState extends State<BwdAi> {
         headers: {
           HttpHeaders.contentTypeHeader: ContentType.json.mimeType,
           HttpHeaders.acceptHeader: 'application/json',
-// NEW: Optional API key header for authentication
           if (const String.fromEnvironment('BWD_API_KEY').isNotEmpty)
             'x-api-key': const String.fromEnvironment('BWD_API_KEY'),
         },
@@ -980,7 +903,6 @@ class _BwdAiState extends State<BwdAi> {
       state.enqueueSnack(ok
           ? "Session submitted successfully!"
           : "Submission failed: HTTP ${res.statusCode}");
-// FIX: Add a helpful snackbar message for large payload failures
       if (res.statusCode == 413) {
         state.enqueueSnack(
             "Submission failed: Session too large for the server. Consider splitting.");
@@ -997,8 +919,6 @@ class _BwdAiState extends State<BwdAi> {
       return false;
     }
   }
-
-  // Main UI remains unchanged, just calling the new methods
   @override
   Widget build(BuildContext context) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1080,8 +1000,6 @@ class _BwdAiState extends State<BwdAi> {
     );
   }
 }
-
-// =================== UPDATED CONNECT TAB ===================
 class _ConnectTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback onChanged;
@@ -1225,7 +1143,6 @@ class _ConnectTabState extends State<_ConnectTab> {
               itemBuilder: (_, i) {
                 final sr = widget.devices[i];
                 final d = sr.device;
-// FIX: Replaced .str with .toString()
                 final name = sr.advertisementData.advName.isNotEmpty
                     ? sr.advertisementData.advName
                     : (d.platformName?.isNotEmpty == true
@@ -1271,8 +1188,6 @@ class _ConnectTabState extends State<_ConnectTab> {
     );
   }
 }
-
-// =================== UPDATED TRAINING TAB ===================
 class _TrainingTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback notify;
@@ -1289,7 +1204,6 @@ class _TrainingTab extends StatefulWidget {
   @override
   State<_TrainingTab> createState() => _TrainingTabState();
 }
-
 class _TrainingTabState extends State<_TrainingTab>
     with SingleTickerProviderStateMixin {
   late AnimationController _pulseController;
@@ -1304,7 +1218,6 @@ class _TrainingTabState extends State<_TrainingTab>
     _pulseAnimation =
         CurvedAnimation(parent: _pulseController, curve: Curves.easeIn);
   }
-
   @override
   void didUpdateWidget(covariant _TrainingTab oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -1316,13 +1229,11 @@ class _TrainingTabState extends State<_TrainingTab>
       }
     }
   }
-
   @override
   void dispose() {
     _pulseController.dispose();
     super.dispose();
   }
-
   Future<void> _confirmEnd(BuildContext context) async {
     final s = widget.state;
     final snap = TrainingSession(
@@ -1374,7 +1285,6 @@ class _TrainingTabState extends State<_TrainingTab>
       widget.notify();
     }
   }
-
   Future<String?> _saveCsvToDisk(TrainingSession session) async {
     final messenger = ScaffoldMessenger.of(context);
     try {
@@ -1383,31 +1293,23 @@ class _TrainingTabState extends State<_TrainingTab>
         messenger.showSnackBar(const SnackBar(content: Text("No data to export.")));
         return null;
       }
-
-      // Build CSV text (deterministic header order)
       final headers = const ['timestamp', 'rssi', 'handbrake', 'ignition', 'door', 'label'];
       final buf = StringBuffer()..writeln(headers.join(','));
       for (final row in csvData) {
         buf.writeln(headers.map((h) => _csvEscape(row[h])).join(','));
       }
       final csvString = buf.toString();
-
-      // Pick a path
       final ts = DateTime.now().toIso8601String();
-      // Sanitization regex: your filename regex is solid.
       final safeTs = ts.replaceAll(RegExp(r'[<>:"/\\|?*\s]+'), '-');
       final fname = 'bwd_${session.tag}_$safeTs.csv';
 
       Directory base;
       if (Platform.isAndroid) {
-        // Android 11+ (scoped storage)
         base = (await getExternalStorageDirectory())!;
-        // Create an app subfolder so users can find files easily
         final appDir = Directory('${base.path}/BWD');
         if (!(await appDir.exists())) await appDir.create(recursive: true);
         base = appDir;
       } else {
-        // iOS/macOS
         base = await getApplicationDocumentsDirectory();
       }
 
@@ -1423,13 +1325,11 @@ class _TrainingTabState extends State<_TrainingTab>
       return null;
     }
   }
-
   Future<void> _openReviewSheet(BuildContext context, TrainingSession session) async {
     final s = widget.state;
-    bool submitEnabled = true; // Changed to true for immediate enablement
+    bool submitEnabled = true;
     bool isSubmitting = false;
-    bool toTesting = false; // New state variable for the toggle
-
+    bool toTesting = s.eiUploadToTesting;
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -1450,9 +1350,28 @@ class _TrainingTabState extends State<_TrainingTab>
                 setState(() => isSubmitting = true);
                 final success = await widget.submitSession(session);
                 if (!mounted) return;
+
                 if (success) {
                   s.history.insert(0, session);
                   s.discardTraining();
+
+                  const eiApiKey = String.fromEnvironment('EI_PROJECT_API_KEY');
+                  if (eiApiKey.isNotEmpty) {
+                    final eiJson = session.toEdgeImpulseIngestionJson();
+                    final ok = await _uploadEiJson(
+                      eiJson: eiJson,
+                      apiKey: eiApiKey,
+                      fileName: 'bwd_${session.tag}_${DateTime.now().millisecondsSinceEpoch}.json',
+                      label: session.eiLabel,
+                      toTesting: toTesting,
+                    );
+                    s.enqueueSnack(ok
+                        ? 'Auto-uploaded to Edge Impulse ✅'
+                        : 'Auto-upload to EI failed ❌');
+                  } else {
+                    s.enqueueSnack('EI_PROJECT_API_KEY not set. Skipping auto-upload.');
+                  }
+
                   s.enqueueSnack('Session submitted.');
                   Navigator.pop(ctx);
                 } else {
@@ -1460,10 +1379,7 @@ class _TrainingTabState extends State<_TrainingTab>
                   messenger.showSnackBar(
                     SnackBar(
                       content: const Text("Submission failed. Retry?"),
-                      action: SnackBarAction(
-                        label: "RETRY",
-                        onPressed: _submitAndClose,
-                      ),
+                      action: SnackBarAction(label: "RETRY", onPressed: _submitAndClose),
                     ),
                   );
                 }
@@ -1517,11 +1433,13 @@ class _TrainingTabState extends State<_TrainingTab>
                             ),
                           ),
                           const SizedBox(height: 12),
-                          // New toggle switch for Testing vs Training set
                           SwitchListTile(
                             title: const Text('Upload to Testing set'),
                             value: toTesting,
-                            onChanged: isSubmitting ? null : (v) => setState(() => toTesting = v),
+                            onChanged: isSubmitting ? null : (v) => setState(() {
+                              toTesting = v;
+                              s.eiUploadToTesting = v;
+                            }),
                             secondary: const Icon(Icons.psychology_outlined),
                           ),
                         ],
@@ -1546,7 +1464,6 @@ class _TrainingTabState extends State<_TrainingTab>
                                       icon: const Icon(Icons.copy_all),
                                       label: const Text("Copy JSON"),
                                       onPressed: isSubmitting ? null : () async {
-                                        // MODIFIED: In Demo Mode, copy the EI JSON instead of the preview JSON.
                                         final content = kDemoMode
                                             ? const JsonEncoder.withIndent(' ').convert(session.toEdgeImpulseIngestionJson())
                                             : pretty;
@@ -1608,7 +1525,6 @@ class _TrainingTabState extends State<_TrainingTab>
                                           messenger.showSnackBar(const SnackBar(content: Text("Missing EI API key")));
                                           return;
                                         }
-
                                         final eiJson = session.toEdgeImpulseIngestionJson();
                                         final ok = await _uploadEiJson(
                                           eiJson: eiJson,
@@ -1675,7 +1591,6 @@ class _TrainingTabState extends State<_TrainingTab>
       },
     );
   }
-
   @override
   Widget build(BuildContext context) {
     final s = widget.state;
@@ -1692,7 +1607,7 @@ class _TrainingTabState extends State<_TrainingTab>
             shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(kCardRadius)),
             child: Padding(
-              padding: const EdgeInsets.all(16.0),
+              padding: const EdgeInsets.all(12.0),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -1719,7 +1634,7 @@ class _TrainingTabState extends State<_TrainingTab>
                       ],
                     ],
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 8),
                   Container(
                     decoration: BoxDecoration(
                       color: scheme.brightness == Brightness.dark
@@ -1760,9 +1675,9 @@ class _TrainingTabState extends State<_TrainingTab>
                       ],
                     ),
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 8),
                   const Divider(height: 0, thickness: 0.6),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 8),
                   Text('Training Tags',
                       style: Theme.of(context).textTheme.titleMedium),
                   const SizedBox(height: 8),
@@ -1788,7 +1703,7 @@ class _TrainingTabState extends State<_TrainingTab>
                     enabled: !s.isTraining,
                     onSelected: (t) => setState(() => s.selectedTag = t),
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 8),
                   SizedBox(
                     width: double.infinity,
                     child: Tooltip(
@@ -1852,36 +1767,31 @@ class _TrainingTabState extends State<_TrainingTab>
               ),
             ),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 8),
           Text('Live Event Stream',
               style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 8),
           Expanded(
             child: s.isTraining
-                ? _LiveEventList(state: s, notify: widget.notify)
+                ? _LiveEventList(state: s)
                 : s.buffer.isEmpty
                 ? const Center(
                 child: Text(
                     "Live events will appear here once training starts."))
-                : _LiveEventList(state: s, notify: widget.notify),
+                : _LiveEventList(state: s),
           ),
         ],
       ),
     );
   }
 }
-
-//... (The rest of the code for _HistoryTab, _LiveEventList, and helpers are unchanged)
-//...
 const int RSSI_GOOD = -50;
 const int RSSI_OK = -70;
-// RSSI bucket edge: _getRssiColor treats exactly -50 and -70 as the lower tier due to > checks. If you care, switch to >= so -50 is green and -70 is orange.
 Color _getRssiColor(int rssi) {
   if (rssi >= RSSI_GOOD) return Colors.green;
   if (rssi >= RSSI_OK) return Colors.orange;
   return Colors.red;
 }
-
 Widget _rssiChip(int? rssi) {
   final has = rssi != null;
   final color = has ? _getRssiColor(rssi!) : Colors.grey;
@@ -1908,7 +1818,6 @@ Widget _rssiChip(int? rssi) {
     ),
   );
 }
-
 Widget _kv(String k, String v) => Padding(
   padding: const EdgeInsets.symmetric(vertical: 2),
   child: Row(
@@ -1928,63 +1837,60 @@ Widget _kv(String k, String v) => Padding(
 
 class _LiveEventList extends StatefulWidget {
   final _UiState state;
-  final VoidCallback notify;
-  const _LiveEventList({required this.state, required this.notify});
+  const _LiveEventList({required this.state});
   @override
   _LiveEventListState createState() => _LiveEventListState();
 }
 
 class _LiveEventListState extends State<_LiveEventList> {
-// NEW: The periodic timer for repainting has been removed since the notify listener
-// already triggers UI updates efficiently.
+  final _scrollController = ScrollController();
+  bool get _atLiveEdge => !_scrollController.hasClients ? true : _scrollController.offset <= 24.0;
+
+  @override
+  void didUpdateWidget(covariant _LiveEventList oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_atLiveEdge && _scrollController.hasClients) {
+        _scrollController.jumpTo(0.0);
+      }
+    });
+  }
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
   @override
   Widget build(BuildContext context) {
     final s = widget.state;
     if (s.buffer.isEmpty) {
       return const Center(
-          child: Text("Initializing stream...",
-              style: TextStyle(fontStyle: FontStyle.italic)));
+        child: Text(
+          "Initializing stream...",
+          style: TextStyle(fontStyle: FontStyle.italic),
+        ),
+      );
     }
+    final total = s.buffer.length;
+    final start = math.max(0, total - 200); // Show last 200 events
+    final view = s.buffer.sublist(start);
+
     return ListView.builder(
+      controller: _scrollController,
       reverse: true,
-      padding: EdgeInsets.zero,
       physics: const BouncingScrollPhysics(),
-      prototypeItem: const Column(
-        children: [
-          Padding(
-            padding: EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-            child: Row(
-              children: [
-                Expanded(
-                    child: Text("ts: 00.00s", style: TextStyle(fontSize: 13))),
-                Text("RSSI: -00 dBm", style: TextStyle(fontSize: 13)),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
-            child: Text(
-              "Handbrake: • Door: • Ignition: •",
-              style: TextStyle(fontSize: 12.5, height: 1.2),
-            ),
-          ),
-          Divider(height: 0, thickness: 0.6),
-        ],
-      ),
-      itemCount: s.buffer.length,
+      itemCount: view.length,
       itemBuilder: (_, idx) {
-        final e = s.buffer[s.buffer.length - 1 - idx];
-        final rssiStatus =
-        e.rssi >= RSSI_GOOD ? 'good' : (e.rssi >= RSSI_OK ? 'fair' : 'poor');
+        final e = view[idx];
+        final rssiStatus = e.rssi >= RSSI_GOOD ? 'good' : (e.rssi >= RSSI_OK ? 'fair' : 'poor');
+
         return Semantics(
-          label:
-          'ts ${e.ts}s, RSSI ${e.rssi} dBm $rssiStatus, handbrake ${e.handBrakeStatus == 1 ? 'engaged' : 'disengaged'}',
+          label: 'ts ${e.ts}s, RSSI ${e.rssi} dBm $rssiStatus, handbrake ${e.handBrakeStatus == 1 ? 'engaged' : 'disengaged'}',
           child: Column(
             key: ValueKey(e.note),
             children: [
               Padding(
-                padding:
-                const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
                 child: Row(
                   children: [
                     Expanded(
@@ -1995,6 +1901,7 @@ class _LiveEventListState extends State<_LiveEventList> {
                           fontFeatures: [FontFeature.tabularFigures()],
                         ),
                         overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
                       ),
                     ),
                     Text(
@@ -2018,6 +1925,8 @@ class _LiveEventListState extends State<_LiveEventList> {
                       "Door: ${e.doorStatus == 1 ? 'Open' : 'Closed'} · "
                       "Ignition: ${e.ignitionStatus == 1 ? 'On' : 'Off'}",
                   style: const TextStyle(fontSize: 12.5, height: 1.2),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
               const Divider(height: 0, thickness: 0.6),
@@ -2028,7 +1937,6 @@ class _LiveEventListState extends State<_LiveEventList> {
     );
   }
 }
-
 class _HistoryTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback notify;
@@ -2036,7 +1944,6 @@ class _HistoryTab extends StatefulWidget {
   @override
   State<_HistoryTab> createState() => _HistoryTabState();
 }
-
 class _HistoryTabState extends State<_HistoryTab> {
   int _page = 1;
   static const _per = 5;
