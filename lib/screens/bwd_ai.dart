@@ -37,6 +37,7 @@ String _apiTagFor(String tag) {
       return tag;
   }
 }
+
 Future<bool> _uploadEiJson({
   required Map<String, dynamic> eiJson,
   required String apiKey,
@@ -61,6 +62,7 @@ Future<bool> _uploadEiJson({
   }
   return ok;
 }
+
 Future<bool> _uploadCsvToEdgeImpulse({
   required String csvPath,
   required String apiKey,
@@ -166,6 +168,7 @@ class Event {
   });
   Map<String, dynamic> toJson() => {
     IngestKeys.timestamp: double.parse(ts.toStringAsFixed(1)),
+    // seconds, 0.1 precision
     IngestKeys.rssi: double.parse(rssi.toStringAsFixed(1)),
     IngestKeys.handBrakeStatus: handBrakeStatus,
     IngestKeys.doorStatus: doorStatus,
@@ -213,6 +216,8 @@ class TrainingSession {
       "maxRssi": double.parse(maxRssi.toStringAsFixed(1)),
     }
   };
+
+  // === STEP 3: FIX TrainingSession.toIngestionJson() (TOP-LEVEL FIELDS) ===
   Map<String, dynamic> toIngestionJson({
     required String deviceMac,
     String? appVersion,
@@ -223,6 +228,7 @@ class TrainingSession {
         IngestKeys.sessionId: id,
         IngestKeys.deviceMac: deviceMac,
         IngestKeys.tag: tag,
+        // This will be overwritten by the API tag
         IngestKeys.startedAt: startedAt.toUtc().toIso8601String(),
         IngestKeys.endedAt: endedAt.toUtc().toIso8601String(),
         if (appVersion != null) IngestKeys.appVersion: appVersion,
@@ -238,6 +244,8 @@ class TrainingSession {
             "maxRssi": double.parse(maxRssi.toStringAsFixed(1)),
           }
       };
+
+  /// NEW: Generates a JSON payload in the Edge Impulse ingestion format.
   Map<String, dynamic> toEdgeImpulseIngestionJson() {
     final values = <List<double>>[];
     int lastMs = -999;
@@ -585,6 +593,7 @@ class _BwdAiState extends State<BwdAi> {
     state.enqueueSnack("Connecting to $displayName...");
     try {
       await d.connect(timeout: const Duration(seconds: 10), autoConnect: false);
+// NEW: Request a larger MTU on Android to reduce packet fragmentation
       if (Platform.isAndroid) {
         try {
           await d.requestMtu(247);
@@ -608,6 +617,7 @@ class _BwdAiState extends State<BwdAi> {
         }
       });
       await _discoverServices();
+      // Add a quick if (!mounted) return; after await in _connectToDevice right before setState
       if (!mounted) return;
       setState(() {});
     } catch (e) {
@@ -628,9 +638,11 @@ class _BwdAiState extends State<BwdAi> {
         final id = c.uuid.toString().toLowerCase();
         if (id == kBwdCtrlCharUuid.toLowerCase()) _ctrlChar = c;
         if (id == kBwdRssiCharUuid.toLowerCase()) _rssiChar = c;
+// NEW: Get the characteristic for the firmware version
         if (id == kBwdStateCharUuid.toLowerCase()) _stateChar = c;
       }
       state.enqueueSnack("Services discovered.");
+// NEW: Read the firmware version once and cache it.
       try {
         final raw = await _stateChar?.read();
         if (raw != null && raw.isNotEmpty) {
@@ -638,13 +650,16 @@ class _BwdAiState extends State<BwdAi> {
           state.enqueueSnack("Firmware Version: $_cachedFwVersion");
         }
       } catch (_) {
+// Ignore errors, it's an optional field
       }
+      // If we dropped mid-session, make sure device state is cleared
       if (state.pendingEndTrain && _ctrlChar != null) {
         try {
           await _sendEndTraining(false);
         } catch (_) {}
         state.pendingEndTrain = false;
       }
+      // Add a quick if (!mounted) return; in _discoverServices when calling setState()
       if (!mounted) return;
       setState(() {});
     } catch (e) {
@@ -713,6 +728,8 @@ class _BwdAiState extends State<BwdAi> {
     await _safeWrite(_ctrlChar!, utf8.encode(payload));
     _subscribeTraining();
   }
+
+  /// PATCH: Now also disables notifications on the characteristic and resets the UI state immediately.
   Future<void> _sendEndTraining(bool save) async {
     if (kDemoMode) {
       _demoTimer?.cancel();
@@ -730,20 +747,25 @@ class _BwdAiState extends State<BwdAi> {
     await Future.delayed(const Duration(milliseconds: 200)); // allow tail packets
     try {
       await _rssiChar?.setNotifyValue(false);
-    } catch (_) {}
+    } catch (_) {} // NEW: Disable notifications on the BLE device
     await _notifySub?.cancel();
     _notifySub = null;
-    _streamWatchdog?.cancel();
+    _streamWatchdog?.cancel(); // Cancel watchdog immediately
     _streamWatchdog = null;
     state.isTraining = false;
+// NEW: Clear the line buffer to prevent stale data on the next session
     state._notifyBuf = "";
     if (mounted) setState(() {});
   }
+
+  /// Subscribes to the characteristic that streams the training data.
+  /// This is where the real-time data flow begins.
   Future<void> _subscribeTraining() async {
     if (_rssiChar == null) {
       state.enqueueSnack('Training stream characteristic not found.');
       return;
     }
+// NEW: Clear the buffer at the beginning of a new session
     state._notifyBuf = "";
     bool ok = false;
     try {
@@ -754,21 +776,27 @@ class _BwdAiState extends State<BwdAi> {
     }
     if (!ok) return;
     _notifySub?.cancel();
+// This listener handles the incoming streamed data and buffers it.
     _notifySub = _rssiChar!.value.listen(_handleTrainingNotify);
     state.isTraining = true;
     state.buffer.clear();
     _kickStreamWatchdog();
     setState(() {});
   }
+
+  /// FIX: Replaces the simple newline parser with a more robust one that handles
+  /// both newline-delimited and brace-balanced JSON.
   void _handleTrainingNotify(List<int> bytes) {
     _kickStreamWatchdog();
     state._notifyBuf += utf8.decode(bytes);
+// First try newline framing
     int nl;
     while ((nl = state._notifyBuf.indexOf('\n')) != -1) {
       final line = state._notifyBuf.substring(0, nl).trim();
       state._notifyBuf = state._notifyBuf.substring(nl + 1);
       if (line.isNotEmpty) _parseEventLine(line);
     }
+// Fallback: brace-balanced parse if no newlines
     int depth = 0, start = -1;
     for (int i = 0; i < state._notifyBuf.length; i++) {
       final ch = state._notifyBuf[i];
@@ -786,6 +814,8 @@ class _BwdAiState extends State<BwdAi> {
       }
     }
   }
+
+  // FIXED: The _parseEventLine method is now correctly a member of _BwdAiState
   void _parseEventLine(String line) {
     try {
       final Map<String, dynamic> p = json.decode(line);
@@ -794,7 +824,9 @@ class _BwdAiState extends State<BwdAi> {
           : (p.containsKey('RSSI') ? p['RSSI'] : -127);
       final event = Event(
         ts: _clampTs(_num<double>(p['timestamp'], 0.0)),
+        // Accepts both int and float; rounds once
         rssi: _clampRssiDouble(_num<double>(rssiSrc, -127.0)),
+        // If firmware ever sends lowercase, add a synonym read
         handBrakeStatus: _clampi01(_num<int>(
             p.containsKey('handBrakeStatus') ? p['handBrakeStatus'] : p['handbrake'], 0)),
         doorStatus: _clampi01(_num<int>(
@@ -810,6 +842,7 @@ class _BwdAiState extends State<BwdAi> {
       }
       state.buffer.add(event);
       state.currentRssi = event.rssi.round();
+      // Use the throttle to request a rebuild instead of calling setState directly
       _requestLiveListRebuild();
     } catch (e) {
       state.enqueueSnack("Failed to parse training data: $e");
@@ -824,6 +857,8 @@ class _BwdAiState extends State<BwdAi> {
       _listRebuildThrottle = null;
     });
   }
+
+  // A super-light retry on transient 5xx
   Future<http.Response> _postWithRetry(Uri uri, {required Map<String,String> headers, required String body}) async {
     int attempt = 0;
     while (true) {
@@ -837,38 +872,55 @@ class _BwdAiState extends State<BwdAi> {
       attempt++;
     }
   }
+
+  /// This function is responsible for sending the buffered data to the AI developer's server.
+  /// It now uses the new, ingestion-friendly payload.
   Future<bool> _submitSession(TrainingSession session) async {
+    // --- DEMO: simulate a successful submit so the flow + History work ---
     if (kDemoMode) {
       await Future.delayed(const Duration(milliseconds: 300));
       state.enqueueSnack("Demo: submit simulated ✅ (not sent to server)");
-      return true;
+      return true; // <-- allows History insert + sheet to close
     }
+
+// NEW: Block submission if device MAC is missing.
     if ((state.connectedMac ?? "").isEmpty) {
       state.enqueueSnack("Device MAC missing. Please reconnect and try again.");
       return false;
     }
+// NEW: Basic validation to prevent submission of invalid sessions
     if (session.tag.isEmpty || session.count == 0 || session.durationSec <= 0) {
       state.enqueueSnack("Nothing to submit (tag/events/duration invalid).");
       return false;
     }
+// PATCH: Add submission size guard as a sanity check.
     if (session.count > 10000) {
       state.enqueueSnack(
           "Large session (${session.count} events). Consider splitting.");
+// You can decide to return false here if the payload is too large for your backend
     }
+// PATCH 4: Guard against placeholder URL
     if (kServerUrl.isEmpty ||
         kServerUrl.contains('your.api.endpoint') ||
         kServerUrl.contains('<your-backend>')) {
       state.enqueueSnack("Server URL not configured. Submissions blocked.");
       return false;
     }
+
+// === STEP 5: SORT EVENTS BEFORE SUBMIT ===
     final sorted = session.sortedByTimestamp();
+// === STEP 9: ADD A PAYLOAD VALIDATOR ===
     final payload = sorted.toIngestionJson(
-      deviceMac: state.connectedMac ?? "UNKNOWN",
-      appVersion: "1.0.0",
-      firmwareVersion: _cachedFwVersion,
-      includeMeta: false,
+      deviceMac: state.connectedMac ?? "UNKNOWN", // NEW: Provide the raw MAC
+      appVersion: "1.0.0", // New field as requested
+      firmwareVersion: _cachedFwVersion, // New optional field
+      includeMeta: false, // Force this to false to ensure a flat payload
     );
+
+    // FIX: Apply the API tag mapping here
     payload[IngestKeys.tag] = _apiTagFor(sorted.tag);
+
+    // Tiny hardening nit: assert that CSV headers are stable in debug mode.
     assert(
     const DeepCollectionEquality().equals(
       (payload[IngestKeys.events] as List).first.keys.toSet(),
@@ -887,6 +939,7 @@ class _BwdAiState extends State<BwdAi> {
       state.enqueueSnack("Payload validation failed!");
       return false;
     }
+
     try {
       final uri = Uri.parse(kServerUrl);
       final res = await _postWithRetry(
@@ -894,6 +947,7 @@ class _BwdAiState extends State<BwdAi> {
         headers: {
           HttpHeaders.contentTypeHeader: ContentType.json.mimeType,
           HttpHeaders.acceptHeader: 'application/json',
+// NEW: Optional API key header for authentication
           if (const String.fromEnvironment('BWD_API_KEY').isNotEmpty)
             'x-api-key': const String.fromEnvironment('BWD_API_KEY'),
         },
@@ -903,6 +957,7 @@ class _BwdAiState extends State<BwdAi> {
       state.enqueueSnack(ok
           ? "Session submitted successfully!"
           : "Submission failed: HTTP ${res.statusCode}");
+// FIX: Add a helpful snackbar message for large payload failures
       if (res.statusCode == 413) {
         state.enqueueSnack(
             "Submission failed: Session too large for the server. Consider splitting.");
@@ -919,6 +974,8 @@ class _BwdAiState extends State<BwdAi> {
       return false;
     }
   }
+
+  // Main UI remains unchanged, just calling the new methods
   @override
   Widget build(BuildContext context) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1000,6 +1057,8 @@ class _BwdAiState extends State<BwdAi> {
     );
   }
 }
+
+// =================== UPDATED CONNECT TAB ===================
 class _ConnectTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback onChanged;
@@ -1143,6 +1202,7 @@ class _ConnectTabState extends State<_ConnectTab> {
               itemBuilder: (_, i) {
                 final sr = widget.devices[i];
                 final d = sr.device;
+// FIX: Replaced .str with .toString()
                 final name = sr.advertisementData.advName.isNotEmpty
                     ? sr.advertisementData.advName
                     : (d.platformName?.isNotEmpty == true
@@ -1300,16 +1360,20 @@ class _TrainingTabState extends State<_TrainingTab>
       }
       final csvString = buf.toString();
       final ts = DateTime.now().toIso8601String();
+      // Sanitization regex: your filename regex is solid.
       final safeTs = ts.replaceAll(RegExp(r'[<>:"/\\|?*\s]+'), '-');
       final fname = 'bwd_${session.tag}_$safeTs.csv';
 
       Directory base;
       if (Platform.isAndroid) {
+        // Android 11+ (scoped storage)
         base = (await getExternalStorageDirectory())!;
+        // Create an app subfolder so users can find files easily
         final appDir = Directory('${base.path}/BWD');
         if (!(await appDir.exists())) await appDir.create(recursive: true);
         base = appDir;
       } else {
+        // iOS/macOS
         base = await getApplicationDocumentsDirectory();
       }
 
@@ -1327,9 +1391,10 @@ class _TrainingTabState extends State<_TrainingTab>
   }
   Future<void> _openReviewSheet(BuildContext context, TrainingSession session) async {
     final s = widget.state;
-    bool submitEnabled = true;
+    bool submitEnabled = true; // Changed to true for immediate enablement
     bool isSubmitting = false;
-    bool toTesting = s.eiUploadToTesting;
+    bool toTesting = s.eiUploadToTesting; // Initialize with the persisted state
+
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -1355,6 +1420,7 @@ class _TrainingTabState extends State<_TrainingTab>
                   s.history.insert(0, session);
                   s.discardTraining();
 
+                  // === Auto-upload to Edge Impulse on success ===
                   const eiApiKey = String.fromEnvironment('EI_PROJECT_API_KEY');
                   if (eiApiKey.isNotEmpty) {
                     final eiJson = session.toEdgeImpulseIngestionJson();
@@ -1363,7 +1429,7 @@ class _TrainingTabState extends State<_TrainingTab>
                       apiKey: eiApiKey,
                       fileName: 'bwd_${session.tag}_${DateTime.now().millisecondsSinceEpoch}.json',
                       label: session.eiLabel,
-                      toTesting: toTesting,
+                      toTesting: toTesting, // <-- use the toggle value
                     );
                     s.enqueueSnack(ok
                         ? 'Auto-uploaded to Edge Impulse ✅'
@@ -1371,6 +1437,7 @@ class _TrainingTabState extends State<_TrainingTab>
                   } else {
                     s.enqueueSnack('EI_PROJECT_API_KEY not set. Skipping auto-upload.');
                   }
+                  // === end auto-upload ===
 
                   s.enqueueSnack('Session submitted.');
                   Navigator.pop(ctx);
@@ -1438,7 +1505,7 @@ class _TrainingTabState extends State<_TrainingTab>
                             value: toTesting,
                             onChanged: isSubmitting ? null : (v) => setState(() {
                               toTesting = v;
-                              s.eiUploadToTesting = v;
+                              s.eiUploadToTesting = v; // Persist the value
                             }),
                             secondary: const Icon(Icons.psychology_outlined),
                           ),
@@ -1464,6 +1531,7 @@ class _TrainingTabState extends State<_TrainingTab>
                                       icon: const Icon(Icons.copy_all),
                                       label: const Text("Copy JSON"),
                                       onPressed: isSubmitting ? null : () async {
+                                        // MODIFIED: In Demo Mode, copy the EI JSON instead of the preview JSON.
                                         final content = kDemoMode
                                             ? const JsonEncoder.withIndent(' ').convert(session.toEdgeImpulseIngestionJson())
                                             : pretty;
@@ -1525,6 +1593,7 @@ class _TrainingTabState extends State<_TrainingTab>
                                           messenger.showSnackBar(const SnackBar(content: Text("Missing EI API key")));
                                           return;
                                         }
+
                                         final eiJson = session.toEdgeImpulseIngestionJson();
                                         final ok = await _uploadEiJson(
                                           eiJson: eiJson,
@@ -1877,10 +1946,11 @@ class _LiveEventListState extends State<_LiveEventList> {
 
     return ListView.builder(
       controller: _scrollController,
-      reverse: true,
+      reverse: true, // Newest items stick to the bottom/start of the list
       physics: const BouncingScrollPhysics(),
       itemCount: view.length,
       itemBuilder: (_, idx) {
+        // Access the item directly from the sublist
         final e = view[idx];
         final rssiStatus = e.rssi >= RSSI_GOOD ? 'good' : (e.rssi >= RSSI_OK ? 'fair' : 'poor');
 
