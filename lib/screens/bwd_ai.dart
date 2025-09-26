@@ -14,6 +14,147 @@ import 'package:share_plus/share_plus.dart';
 import 'package:http_parser/http_parser.dart';
 import 'package:flutter/foundation.dart';
 import 'package:collection/collection.dart';
+
+const bool kAppendSetSuffixInLabel = true;
+const canonicalLabels = <String>{
+  'Driver_Approaching_Vehicle',
+  'Driver_Entering_Vehicle',
+  'Driver_Inside_Vehicle',
+  'Driver_Leaving_Vehicle',
+  'Driver_Walking_Away',
+  'Unauthorized_Entry',
+  'Unauthorized_Use_Attempted',
+};
+
+String normalizeLabel(String raw) {
+  final s = raw.trim();
+  return s.replaceFirst(RegExp(r'__(TRAIN|TEST)$', caseSensitive: false), '');
+}
+
+void assertCanonical(String label) {
+  if (!canonicalLabels.contains(label)) {
+    throw StateError('Unknown label: $label (must be one of: ${canonicalLabels.join(', ')})');
+  }
+}
+
+bool isMixed(String label) => label.toLowerCase() == 'mixed';
+
+String? labelForUpload({required String canonical, required bool toTesting, required bool isMixed}) {
+  if (isMixed && toTesting) return null;
+  return kAppendSetSuffixInLabel ? '${canonical}__${toTesting ? "TEST" : "TRAIN"}' : canonical;
+}
+
+// 1) Add a stem builder (top-level helper)
+String eiFileStem({
+  required String canonical, // e.g. "Driver_Walking_Away"
+  required bool toTesting,   // true => TEST, false => TRAIN
+}) {
+  final set = toTesting ? "TEST" : "TRAIN";
+  // Desired front: "Driver_Walking_Away.Driver_Walking_Away__TEST"
+  return "$canonical.${canonical}__${set}";
+}
+
+// A new helper to ensure consistent filenames. (NOTE: This function is replaced by eiFileStem logic in usage)
+String fileBaseLabel({
+  required String eiLabel,
+  required bool toTesting,
+  required bool isMixed,
+}) {
+  final upload = labelForUpload(canonical: eiLabel, toTesting: toTesting, isMixed: isMixed);
+  final setSuffix = toTesting ? "TEST" : "TRAIN";
+  return (upload != null)
+      ? upload
+      : (isMixed ? "MIXED_UNLABELED" : "${eiLabel}_$setSuffix");
+}
+
+class LabelSpan {
+  final String label;
+  final int startIndex;
+  final int endIndex;
+  LabelSpan(this.label, this.startIndex, this.endIndex);
+  @override String toString() => 'LabelSpan($label, $startIndex, $endIndex)';
+}
+
+class LabeledFile {
+  final String path;
+  final List<LabelSpan> spans;
+  LabeledFile(this.path, this.spans);
+  @override String toString() => 'LabeledFile($path, spans: ${spans.length})';
+}
+
+List<LabeledFile> parseInfoLabels(Map<String, dynamic> json) {
+  final files = <LabeledFile>[];
+  if (json['files'] is! List) {
+    throw FormatException('info.labels JSON missing "files" list');
+  }
+
+  for (final f in (json['files'] as List)) {
+    if (f is! Map<String, dynamic>) continue;
+
+    final path = f['path'] as String;
+    final normalizedPath = path.trim().replaceAll('\\', '/');
+
+    if (f['labels'] is List && (f['labels'] as List).isNotEmpty) {
+      final spans = <LabelSpan>[];
+      for (final l in (f['labels'] as List)) {
+        if (l is! Map<String, dynamic>) continue;
+        final raw = (l['label'] as String?) ?? 'Unknown_Label';
+        final label = normalizeLabel(raw);
+
+        if (isMixed(label)) {
+          throw StateError('Ranged labels must be canonical; got Mixed in $normalizedPath');
+        }
+        assertCanonical(label);
+
+        spans.add(LabelSpan(
+          label,
+          (l['startIndex'] as num?)?.toInt() ?? 0,
+          (l['endIndex'] as num?)?.toInt() ?? (1 << 30),
+        ));
+      }
+      files.add(LabeledFile(normalizedPath, spans));
+      continue;
+    }
+
+    if (f['label'] is Map) {
+      final raw = (f['label'] as Map)['label'] as String?;
+      if (raw == null) continue;
+
+      final label = normalizeLabel(raw);
+
+      files.add(LabeledFile(normalizedPath, [LabelSpan(label, 0, 1 << 30)]));
+      continue;
+    }
+  }
+  return files;
+}
+
+void validateNoBareMixed(List<LabeledFile> files) {
+  for (final lf in files) {
+    if (lf.spans.length == 1 &&
+        isMixed(lf.spans.first.label) &&
+        lf.spans.first.startIndex == 0 &&
+        lf.spans.first.endIndex == (1 << 30)) {
+      throw StateError(
+          'Encountered "Mixed" without segment ranges in ${lf.path}. '
+              'Please provide multi-label ranges (startIndex/endIndex) like classification export.'
+      );
+    }
+  }
+}
+
+void runDatasetSelfCheck(List<LabeledFile> files) {
+  validateNoBareMixed(files);
+
+  for (final lf in files) {
+    for (final span in lf.spans) {
+      if (isMixed(span.label)) continue;
+      assertCanonical(span.label);
+    }
+  }
+  debugPrint('Dataset check passed: labels canonical, no bare Mixed.');
+}
+
 class IngestKeys {
   static const sessionId = 'sessionId';
   static const deviceMac = 'deviceMac';
@@ -29,6 +170,7 @@ class IngestKeys {
   static const appVersion = 'appVersion';
   static const firmwareVersion = 'firmwareVersion';
 }
+
 String _apiTagFor(String tag) {
   switch (tag) {
     case "baseline":
@@ -74,9 +216,11 @@ Future<bool> _uploadCsvToEdgeImpulse({
   final req = http.MultipartRequest('POST', url)
     ..headers['x-api-key'] = apiKey
     ..headers['x-add-date-id'] = '1';
+
   if (label != null && label.isNotEmpty) {
     req.headers['x-label'] = label;
   }
+
   req.files.add(
     await http.MultipartFile.fromPath(
       'data',
@@ -98,17 +242,14 @@ bool _validateIngestionPayload(Map<String, dynamic> p, {void Function(String)? o
     onError?.call(m);
     return false;
   }
-
   for (final k in [
     IngestKeys.sessionId, IngestKeys.deviceMac, IngestKeys.tag,
     IngestKeys.startedAt, IngestKeys.endedAt, IngestKeys.events
   ]) {
     if (!p.containsKey(k)) return err('Missing key: $k');
   }
-
   final ev = p[IngestKeys.events];
   if (ev is! List || ev.isEmpty) return err('Events missing or empty');
-
   for (final e in ev) {
     if (e is! Map) return err('Event not a map');
     if (e[IngestKeys.timestamp] is! double) return err('Event.timestamp must be double');
@@ -119,6 +260,7 @@ bool _validateIngestionPayload(Map<String, dynamic> p, {void Function(String)? o
   }
   return true;
 }
+
 T _num<T extends num>(Object? v, T fallback) {
   if (v is num) return (T == int ? v.toInt() : v.toDouble()) as T;
   if (v is String) {
@@ -127,30 +269,30 @@ T _num<T extends num>(Object? v, T fallback) {
   }
   return fallback;
 }
+
 double _clampTs(double ts) {
   if (ts.isNaN || ts.isInfinite || ts < 0) return 0.0;
   return ts;
 }
-int _clampRssi(int r) {
-  if (r < -127) return -127;
-  if (r > 20) return 20;
-  return r;
-}
+
 double _clampRssiDouble(double r) {
   if (r < -127.0) return -127.0;
   if (r > 20.0) return 20.0;
   return r;
 }
+
 int _clampi01(num v) {
   final clamped = v.clamp(0, 1);
   return clamped.toInt();
 }
+
 String _csvEscape(Object? v) {
   final s = '$v';
   return (s.contains(',') || s.contains('\n') || s.contains('"'))
       ? '"${s.replaceAll('"', '""')}"'
       : s;
 }
+
 class Event {
   final double ts;
   final double rssi;
@@ -168,7 +310,6 @@ class Event {
   });
   Map<String, dynamic> toJson() => {
     IngestKeys.timestamp: double.parse(ts.toStringAsFixed(1)),
-    // seconds, 0.1 precision
     IngestKeys.rssi: double.parse(rssi.toStringAsFixed(1)),
     IngestKeys.handBrakeStatus: handBrakeStatus,
     IngestKeys.doorStatus: doorStatus,
@@ -183,6 +324,7 @@ class Event {
     "label": label,
   };
 }
+
 class TrainingSession {
   final String id;
   final String tag;
@@ -204,6 +346,7 @@ class TrainingSession {
       events.isEmpty ? 0 : events.map((e) => e.rssi).reduce((a, b) => a + b) / events.length;
   double get minRssi => events.isEmpty ? 0 : events.map((e) => e.rssi).reduce(math.min);
   double get maxRssi => events.isEmpty ? 0 : events.map((e) => e.rssi).reduce(math.max);
+
   Map<String, dynamic> toPreviewJson() => {
     "start": {"command": "startTraining", "tag": tag, "device": device},
     "stream": events.take(math.min(40, events.length)).map((e) => e.toJson()).toList(),
@@ -216,19 +359,16 @@ class TrainingSession {
       "maxRssi": double.parse(maxRssi.toStringAsFixed(1)),
     }
   };
-
-  // === STEP 3: FIX TrainingSession.toIngestionJson() (TOP-LEVEL FIELDS) ===
   Map<String, dynamic> toIngestionJson({
     required String deviceMac,
     String? appVersion,
     String? firmwareVersion,
-    bool includeMeta = false, // <— new
+    bool includeMeta = false,
   }) =>
       {
         IngestKeys.sessionId: id,
         IngestKeys.deviceMac: deviceMac,
         IngestKeys.tag: tag,
-        // This will be overwritten by the API tag
         IngestKeys.startedAt: startedAt.toUtc().toIso8601String(),
         IngestKeys.endedAt: endedAt.toUtc().toIso8601String(),
         if (appVersion != null) IngestKeys.appVersion: appVersion,
@@ -245,11 +385,9 @@ class TrainingSession {
           }
       };
 
-  /// NEW: Generates a JSON payload in the Edge Impulse ingestion format.
   Map<String, dynamic> toEdgeImpulseIngestionJson() {
     final values = <List<double>>[];
     int lastMs = -999;
-    // Iterate through the sorted events and sample at 2 Hz
     final sortedEvents = sortedByTimestamp().events;
     for (final e in sortedEvents) {
       final ms = (e.ts * 1000).round();
@@ -266,9 +404,10 @@ class TrainingSession {
     return {
       "protected": {
         "ver": "v1",
-        "alg": "none"
+        "alg": "HS256",
+        "iat": (DateTime.now().millisecondsSinceEpoch / 1000).round(),
       },
-      "signature": "UNSIGNED",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000000",
       "payload": {
         "device_type": "EDGE_IMPULSE_UPLOADER",
         "interval_ms": 500,
@@ -285,33 +424,27 @@ class TrainingSession {
 
   String get eiLabel {
     switch (tag) {
-      case "approach":
-        return "Driver_Approaching_Vehicle";
-      case "enter":
-        return "Driver_Entering_Vehicle";
-      case "baseline":
-        return "Driver_Inside_Vehicle";
-      case "leave":
-        return "Driver_Leaving_Vehicle";
-      case "depart":
-        return "Driver_Walking_Away";
-      case "unauthorized_entry":
-        return "Unauthorized_Entry";
-      case "unauthorized_use_attempted":
-        return "Unauthorized_Use_Attempted";
-      default:
-        return tag;
+      case "approach": return "Driver_Approaching_Vehicle";
+      case "enter": return "Driver_Entering_Vehicle";
+      case "baseline": return "Driver_Inside_Vehicle";
+      case "leave": return "Driver_Leaving_Vehicle";
+      case "depart": return "Driver_Walking_Away";
+      case "unauthorized_entry": return "Unauthorized_Entry";
+      case "unauthorized_use_attempted": return "Unauthorized_Use_Attempted";
+      case "mixed": return "Mixed";
+
+      default: throw StateError('Unknown training tag "$tag". Cannot map to canonical label.');
     }
   }
 
-  List<Map<String, dynamic>> toCsvData() {
+  List<Map<String, dynamic>> toCsvDataForSet(bool toTesting) {
     final correctedTag = eiLabel;
+
     final List<Event> sampledEvents = [];
     int lastMs = -999;
     for (final e in sortedByTimestamp().events) {
       final ms = (e.ts * 1000).round();
       if (ms - lastMs >= 500) {
-        // enforce 2 Hz
         sampledEvents.add(e);
         lastMs = ms;
       }
@@ -319,6 +452,7 @@ class TrainingSession {
     return sampledEvents.map((e) => e.toCsvRow(correctedTag)).toList();
   }
 }
+
 extension TrainingSessionSorting on TrainingSession {
   TrainingSession sortedByTimestamp() {
     final sorted = List<Event>.from(events)..sort((a, b) => a.ts.compareTo(b.ts));
@@ -358,6 +492,7 @@ class _UiState {
     buffer.clear();
   }
 }
+
 const bool kDemoMode = bool.fromEnvironment('DEMO', defaultValue: true);
 const String kServerUrl = kDemoMode
     ? "https://httpbin.org/post"
@@ -378,10 +513,8 @@ const String kBwdServiceUuid = "fecdcb88-8e90-11ee-b9d1-0242ac120002";
 const String kBwdRssiCharUuid = "fecdce67-8e90-11ee-b9d1-0242ac120002";
 const String kBwdCtrlCharUuid = "fecdce99-8e90-11ee-b9d1-02123c1a000a";
 const String kBwdStateCharUuid = "fecdce68-8e90-11ee-b9d1-0242ac120002";
-String _fakeMac(math.Random r) {
-  String two() => r.nextInt(256).toRadixString(16).padLeft(2, '0').toUpperCase();
-  return "D1:9A:${two()}:${two()}:${two()}:${two()}";
-}
+
+
 class _TagSelector extends StatelessWidget {
   final String? selected;
   final bool enabled;
@@ -412,6 +545,7 @@ class _TagSelector extends StatelessWidget {
     );
   }
 }
+
 class BwdAi extends StatefulWidget {
   const BwdAi({super.key});
   @override
@@ -439,7 +573,6 @@ class _BwdAiState extends State<BwdAi> {
   Timer? _listRebuildThrottle;
   Timer? _demoTimer;
   double _demoTime = 0.0;
-
   @override
   void initState() {
     super.initState();
@@ -461,7 +594,6 @@ class _BwdAiState extends State<BwdAi> {
     super.dispose();
   }
 
-  // === BLE Core functions ===
   Future<void> _initBluetooth() async {
     if (kDemoMode) {
       state.connectedDevice = "BWD-DEMO";
@@ -507,7 +639,6 @@ class _BwdAiState extends State<BwdAi> {
     _devices.clear();
     state.enqueueSnack("Scanning for BWD devices...");
     _scanSub?.cancel();
-    // FIX: Add fallback for nameless devices by checking for the BWD service UUID
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
       for (final r in results) {
         final name = r.advertisementData.advName;
@@ -519,7 +650,7 @@ class _BwdAiState extends State<BwdAi> {
           if (idx == -1) {
             _devices.add(r);
           } else {
-            _devices[idx] = r; // update RSSI
+            _devices[idx] = r;
           }
         }
       }
@@ -593,7 +724,6 @@ class _BwdAiState extends State<BwdAi> {
     state.enqueueSnack("Connecting to $displayName...");
     try {
       await d.connect(timeout: const Duration(seconds: 10), autoConnect: false);
-// NEW: Request a larger MTU on Android to reduce packet fragmentation
       if (Platform.isAndroid) {
         try {
           await d.requestMtu(247);
@@ -605,7 +735,7 @@ class _BwdAiState extends State<BwdAi> {
       _connSub = d.connectionState.listen((s) async {
         if (s == BluetoothConnectionState.disconnected) {
           if (state.isTraining) {
-            state.pendingEndTrain = true; // queue endTrain(false) for next reconnect
+            state.pendingEndTrain = true;
             state.discardTraining();
             state.enqueueSnack("Disconnected: training ended.");
             if (mounted) setState(() {});
@@ -617,7 +747,6 @@ class _BwdAiState extends State<BwdAi> {
         }
       });
       await _discoverServices();
-      // Add a quick if (!mounted) return; after await in _connectToDevice right before setState
       if (!mounted) return;
       setState(() {});
     } catch (e) {
@@ -626,6 +755,7 @@ class _BwdAiState extends State<BwdAi> {
       _beginAutoReconnect();
     }
   }
+
   Future<void> _discoverServices() async {
     if (_connectedDevice == null) return;
     try {
@@ -638,11 +768,9 @@ class _BwdAiState extends State<BwdAi> {
         final id = c.uuid.toString().toLowerCase();
         if (id == kBwdCtrlCharUuid.toLowerCase()) _ctrlChar = c;
         if (id == kBwdRssiCharUuid.toLowerCase()) _rssiChar = c;
-// NEW: Get the characteristic for the firmware version
         if (id == kBwdStateCharUuid.toLowerCase()) _stateChar = c;
       }
       state.enqueueSnack("Services discovered.");
-// NEW: Read the firmware version once and cache it.
       try {
         final raw = await _stateChar?.read();
         if (raw != null && raw.isNotEmpty) {
@@ -650,16 +778,13 @@ class _BwdAiState extends State<BwdAi> {
           state.enqueueSnack("Firmware Version: $_cachedFwVersion");
         }
       } catch (_) {
-// Ignore errors, it's an optional field
       }
-      // If we dropped mid-session, make sure device state is cleared
       if (state.pendingEndTrain && _ctrlChar != null) {
         try {
           await _sendEndTraining(false);
         } catch (_) {}
         state.pendingEndTrain = false;
       }
-      // Add a quick if (!mounted) return; in _discoverServices when calling setState()
       if (!mounted) return;
       setState(() {});
     } catch (e) {
@@ -696,6 +821,7 @@ class _BwdAiState extends State<BwdAi> {
       state.buffer.clear();
       _demoTime = 0.0;
       final rnd = math.Random();
+      state.trainingStartReal = DateTime.now();
       _demoTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
         if (!mounted || !state.isTraining) {
           timer.cancel();
@@ -710,6 +836,9 @@ class _BwdAiState extends State<BwdAi> {
           note: "demo#${state.buffer.length + 1}",
         );
         state.buffer.add(e);
+        if (state.buffer.length > state._bufferCap) {
+          state.buffer.removeAt(0);
+        }
         state.currentRssi = e.rssi.round();
         setState(() {});
         _demoTime += 0.5;
@@ -729,7 +858,6 @@ class _BwdAiState extends State<BwdAi> {
     _subscribeTraining();
   }
 
-  /// PATCH: Now also disables notifications on the characteristic and resets the UI state immediately.
   Future<void> _sendEndTraining(bool save) async {
     if (kDemoMode) {
       _demoTimer?.cancel();
@@ -744,28 +872,24 @@ class _BwdAiState extends State<BwdAi> {
     }
     final payload = jsonEncode({"command": "endTrain", "flag": save});
     await _safeWrite(_ctrlChar!, utf8.encode(payload));
-    await Future.delayed(const Duration(milliseconds: 200)); // allow tail packets
+    await Future.delayed(const Duration(milliseconds: 200));
     try {
       await _rssiChar?.setNotifyValue(false);
-    } catch (_) {} // NEW: Disable notifications on the BLE device
+    } catch (_) {}
     await _notifySub?.cancel();
     _notifySub = null;
-    _streamWatchdog?.cancel(); // Cancel watchdog immediately
+    _streamWatchdog?.cancel();
     _streamWatchdog = null;
     state.isTraining = false;
-// NEW: Clear the line buffer to prevent stale data on the next session
     state._notifyBuf = "";
     if (mounted) setState(() {});
   }
 
-  /// Subscribes to the characteristic that streams the training data.
-  /// This is where the real-time data flow begins.
   Future<void> _subscribeTraining() async {
     if (_rssiChar == null) {
       state.enqueueSnack('Training stream characteristic not found.');
       return;
     }
-// NEW: Clear the buffer at the beginning of a new session
     state._notifyBuf = "";
     bool ok = false;
     try {
@@ -776,7 +900,6 @@ class _BwdAiState extends State<BwdAi> {
     }
     if (!ok) return;
     _notifySub?.cancel();
-// This listener handles the incoming streamed data and buffers it.
     _notifySub = _rssiChar!.value.listen(_handleTrainingNotify);
     state.isTraining = true;
     state.buffer.clear();
@@ -784,19 +907,15 @@ class _BwdAiState extends State<BwdAi> {
     setState(() {});
   }
 
-  /// FIX: Replaces the simple newline parser with a more robust one that handles
-  /// both newline-delimited and brace-balanced JSON.
   void _handleTrainingNotify(List<int> bytes) {
     _kickStreamWatchdog();
     state._notifyBuf += utf8.decode(bytes);
-// First try newline framing
     int nl;
     while ((nl = state._notifyBuf.indexOf('\n')) != -1) {
       final line = state._notifyBuf.substring(0, nl).trim();
       state._notifyBuf = state._notifyBuf.substring(nl + 1);
       if (line.isNotEmpty) _parseEventLine(line);
     }
-// Fallback: brace-balanced parse if no newlines
     int depth = 0, start = -1;
     for (int i = 0; i < state._notifyBuf.length; i++) {
       final ch = state._notifyBuf[i];
@@ -808,14 +927,13 @@ class _BwdAiState extends State<BwdAi> {
           final jsonStr = state._notifyBuf.substring(start, i + 1);
           _parseEventLine(jsonStr);
           state._notifyBuf = state._notifyBuf.substring(i + 1);
-          i = -1; // restart scan
+          i = -1;
           start = -1;
         }
       }
     }
   }
 
-  // FIXED: The _parseEventLine method is now correctly a member of _BwdAiState
   void _parseEventLine(String line) {
     try {
       final Map<String, dynamic> p = json.decode(line);
@@ -824,9 +942,7 @@ class _BwdAiState extends State<BwdAi> {
           : (p.containsKey('RSSI') ? p['RSSI'] : -127);
       final event = Event(
         ts: _clampTs(_num<double>(p['timestamp'], 0.0)),
-        // Accepts both int and float; rounds once
         rssi: _clampRssiDouble(_num<double>(rssiSrc, -127.0)),
-        // If firmware ever sends lowercase, add a synonym read
         handBrakeStatus: _clampi01(_num<int>(
             p.containsKey('handBrakeStatus') ? p['handBrakeStatus'] : p['handbrake'], 0)),
         doorStatus: _clampi01(_num<int>(
@@ -841,8 +957,10 @@ class _BwdAiState extends State<BwdAi> {
         state.enqueueSnack("Warning: Out-of-order packet received (kept).");
       }
       state.buffer.add(event);
+      if (state.buffer.length > state._bufferCap) {
+        state.buffer.removeAt(0);
+      }
       state.currentRssi = event.rssi.round();
-      // Use the throttle to request a rebuild instead of calling setState directly
       _requestLiveListRebuild();
     } catch (e) {
       state.enqueueSnack("Failed to parse training data: $e");
@@ -858,13 +976,12 @@ class _BwdAiState extends State<BwdAi> {
     });
   }
 
-  // A super-light retry on transient 5xx
   Future<http.Response> _postWithRetry(Uri uri, {required Map<String,String> headers, required String body}) async {
     int attempt = 0;
     while (true) {
       try {
         final res = await http.post(uri, headers: headers, body: body).timeout(const Duration(seconds: 15));
-        if (res.statusCode < 500 || res.statusCode >= 600 || attempt >= 2) return res;
+        if (res.statusCode < 500 || attempt >= 2) return res;
       } catch (_) {
         if (attempt >= 2) rethrow;
       }
@@ -873,54 +990,44 @@ class _BwdAiState extends State<BwdAi> {
     }
   }
 
-  /// This function is responsible for sending the buffered data to the AI developer's server.
-  /// It now uses the new, ingestion-friendly payload.
   Future<bool> _submitSession(TrainingSession session) async {
-    // --- DEMO: simulate a successful submit so the flow + History work ---
+    final isSessMixed = isMixed(session.eiLabel);
+    if (!isSessMixed && !canonicalLabels.contains(session.eiLabel)) {
+      state.enqueueSnack('Invalid session label: ${session.eiLabel}. Submission blocked.');
+      return false;
+    }
+
     if (kDemoMode) {
       await Future.delayed(const Duration(milliseconds: 300));
       state.enqueueSnack("Demo: submit simulated ✅ (not sent to server)");
-      return true; // <-- allows History insert + sheet to close
+      return true;
     }
-
-// NEW: Block submission if device MAC is missing.
     if ((state.connectedMac ?? "").isEmpty) {
       state.enqueueSnack("Device MAC missing. Please reconnect and try again.");
       return false;
     }
-// NEW: Basic validation to prevent submission of invalid sessions
     if (session.tag.isEmpty || session.count == 0 || session.durationSec <= 0) {
       state.enqueueSnack("Nothing to submit (tag/events/duration invalid).");
       return false;
     }
-// PATCH: Add submission size guard as a sanity check.
     if (session.count > 10000) {
       state.enqueueSnack(
           "Large session (${session.count} events). Consider splitting.");
-// You can decide to return false here if the payload is too large for your backend
     }
-// PATCH 4: Guard against placeholder URL
     if (kServerUrl.isEmpty ||
         kServerUrl.contains('your.api.endpoint') ||
         kServerUrl.contains('<your-backend>')) {
       state.enqueueSnack("Server URL not configured. Submissions blocked.");
       return false;
     }
-
-// === STEP 5: SORT EVENTS BEFORE SUBMIT ===
     final sorted = session.sortedByTimestamp();
-// === STEP 9: ADD A PAYLOAD VALIDATOR ===
     final payload = sorted.toIngestionJson(
-      deviceMac: state.connectedMac ?? "UNKNOWN", // NEW: Provide the raw MAC
-      appVersion: "1.0.0", // New field as requested
-      firmwareVersion: _cachedFwVersion, // New optional field
-      includeMeta: false, // Force this to false to ensure a flat payload
+      deviceMac: state.connectedMac ?? "UNKNOWN",
+      appVersion: "1.0.0",
+      firmwareVersion: _cachedFwVersion,
+      includeMeta: false,
     );
-
-    // FIX: Apply the API tag mapping here
     payload[IngestKeys.tag] = _apiTagFor(sorted.tag);
-
-    // Tiny hardening nit: assert that CSV headers are stable in debug mode.
     assert(
     const DeepCollectionEquality().equals(
       (payload[IngestKeys.events] as List).first.keys.toSet(),
@@ -934,12 +1041,10 @@ class _BwdAiState extends State<BwdAi> {
     ),
     'CSV columns mismatch. Check Event.toJson()',
     );
-
     if (!_validateIngestionPayload(payload, onError: state.enqueueSnack)) {
       state.enqueueSnack("Payload validation failed!");
       return false;
     }
-
     try {
       final uri = Uri.parse(kServerUrl);
       final res = await _postWithRetry(
@@ -947,7 +1052,6 @@ class _BwdAiState extends State<BwdAi> {
         headers: {
           HttpHeaders.contentTypeHeader: ContentType.json.mimeType,
           HttpHeaders.acceptHeader: 'application/json',
-// NEW: Optional API key header for authentication
           if (const String.fromEnvironment('BWD_API_KEY').isNotEmpty)
             'x-api-key': const String.fromEnvironment('BWD_API_KEY'),
         },
@@ -957,7 +1061,6 @@ class _BwdAiState extends State<BwdAi> {
       state.enqueueSnack(ok
           ? "Session submitted successfully!"
           : "Submission failed: HTTP ${res.statusCode}");
-// FIX: Add a helpful snackbar message for large payload failures
       if (res.statusCode == 413) {
         state.enqueueSnack(
             "Submission failed: Session too large for the server. Consider splitting.");
@@ -975,7 +1078,46 @@ class _BwdAiState extends State<BwdAi> {
     }
   }
 
-  // Main UI remains unchanged, just calling the new methods
+  Future<void> _tryShareFiles(List<String> paths, {String? text, BuildContext? popContext}) async {
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+
+    messenger.showSnackBar(const SnackBar(content: Text("Preparing share…")));
+
+    if (paths.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text("Nothing to share")));
+      return;
+    }
+    final existing = <XFile>[];
+    for (final p in paths) {
+      try {
+        final f = File(p);
+        if (await f.exists() && (await f.length()) > 0) {
+          existing.add(XFile(p));
+        }
+      } catch (_) {}
+    }
+    if (existing.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text("Share failed: file not found or empty")));
+      return;
+    }
+
+    final popCtx = popContext ?? context;
+    try {
+      Navigator.of(popCtx, rootNavigator: true).maybePop();
+    } catch (_) {}
+    await Future.delayed(const Duration(milliseconds: 150));
+
+    try {
+      await Share.shareXFiles(existing, text: text ?? '');
+      messenger.clearSnackBars();
+      messenger.showSnackBar(const SnackBar(content: Text("Share sheet opened")));
+    } catch (e) {
+      messenger.clearSnackBars();
+      messenger.showSnackBar(SnackBar(content: Text("Share not available on this platform: $e")));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -988,7 +1130,7 @@ class _BwdAiState extends State<BwdAi> {
     });
     return Scaffold(
       appBar: AppBar(
-        title: const Text('BWD AI Training'),
+        title: const Text('BWD AI Trainer'),
         centerTitle: true,
         actions: [
           PopupMenuButton<String>(
@@ -1039,7 +1181,8 @@ class _BwdAiState extends State<BwdAi> {
             notify: () => setState(() {}),
             startTraining: _sendStartTraining,
             endTraining: _sendEndTraining,
-            submitSession: _submitSession, // Pass the new function
+            submitSession: _submitSession,
+            tryShareFiles: _tryShareFiles,
           ),
           _HistoryTab(state: state, notify: () => setState(() {})),
         ],
@@ -1058,7 +1201,6 @@ class _BwdAiState extends State<BwdAi> {
   }
 }
 
-// =================== UPDATED CONNECT TAB ===================
 class _ConnectTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback onChanged;
@@ -1202,7 +1344,6 @@ class _ConnectTabState extends State<_ConnectTab> {
               itemBuilder: (_, i) {
                 final sr = widget.devices[i];
                 final d = sr.device;
-// FIX: Replaced .str with .toString()
                 final name = sr.advertisementData.advName.isNotEmpty
                     ? sr.advertisementData.advName
                     : (d.platformName?.isNotEmpty == true
@@ -1233,7 +1374,6 @@ class _ConnectTabState extends State<_ConnectTab> {
                     subtitle: Text(d.remoteId.toString()),
                     trailing: Chip(
                       label: Text("${sr.rssi} dBm"),
-                      // NITS: Use >= for accurate bucket edges
                       backgroundColor: _getRssiColor(sr.rssi).withOpacity(0.1),
                       side: BorderSide.none,
                     ),
@@ -1248,26 +1388,32 @@ class _ConnectTabState extends State<_ConnectTab> {
     );
   }
 }
+
 class _TrainingTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback notify;
   final Function(String tag) startTraining;
   final Function(bool save) endTraining;
   final Future<bool> Function(TrainingSession) submitSession;
+  final Future<void> Function(List<String> paths, {String? text, BuildContext? popContext}) tryShareFiles;
   const _TrainingTab({
     required this.state,
     required this.notify,
     required this.startTraining,
     required this.endTraining,
     required this.submitSession,
+    required this.tryShareFiles,
   });
   @override
   State<_TrainingTab> createState() => _TrainingTabState();
 }
+
 class _TrainingTabState extends State<_TrainingTab>
     with SingleTickerProviderStateMixin {
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
+  final _rng = math.Random();
+
   @override
   void initState() {
     super.initState();
@@ -1278,6 +1424,7 @@ class _TrainingTabState extends State<_TrainingTab>
     _pulseAnimation =
         CurvedAnimation(parent: _pulseController, curve: Curves.easeIn);
   }
+
   @override
   void didUpdateWidget(covariant _TrainingTab oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -1289,11 +1436,197 @@ class _TrainingTabState extends State<_TrainingTab>
       }
     }
   }
+
   @override
   void dispose() {
     _pulseController.dispose();
     super.dispose();
   }
+
+  Future<String?> _saveEiJsonToDisk(TrainingSession s, {required bool toTesting}) async {
+    try {
+      final eiJson = s.toEdgeImpulseIngestionJson();
+      final jsonString = const JsonEncoder.withIndent(' ').convert(eiJson);
+      final ts = DateTime.now().toIso8601String().replaceAll(RegExp(r'[<>:"/\\|?*\s]+'), '-');
+
+      // 3) Use the stem in your local JSON save (_saveEiJsonToDisk)
+      final canonical = s.eiLabel;
+      final stem = eiFileStem(canonical: canonical, toTesting: toTesting);
+      final fname = '$stem.json';
+
+      Directory base;
+      if (Platform.isAndroid) {
+        base = (await getExternalStorageDirectory())!;
+        final appDir = Directory('${base.path}/BWD');
+        if (!(await appDir.exists())) await appDir.create(recursive: true);
+        base = appDir;
+      } else {
+        base = await getApplicationDocumentsDirectory();
+      }
+      final file = File('${base.path}/$fname');
+      await file.writeAsString(jsonString);
+      return file.path;
+    } catch (e, st) {
+      debugPrint('JSON save to disk failed: $e\n$st');
+      return null;
+    }
+  }
+
+  Future<void> _buildAndUploadMixedTestSample({BuildContext? popContext}) async {
+    final s = widget.state;
+    final messenger = ScaffoldMessenger.of(context);
+
+    final byTag = <String, List<TrainingSession>>{};
+    for (final sess in s.history) {
+      if (sess.tag != "mixed") {
+        byTag.putIfAbsent(sess.tag, () => []).add(sess);
+      }
+    }
+    final availableTags = byTag.keys.toList();
+    availableTags.shuffle(_rng);
+
+    if (availableTags.length < 3) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text("Need 3+ different tags (have 0-2) in history to build Mixed")),
+      );
+      return;
+    }
+
+    final segments = <Event>[];
+    double t = 0.0;
+    for (final tag in availableTags.take(4)) {
+      final tagSessions = byTag[tag]!;
+      final sess = tagSessions[_rng.nextInt(tagSessions.length)].sortedByTimestamp();
+      final take = <Event>[];
+      for (final e in sess.events) {
+        if (e.ts <= 5.0) take.add(e);
+      }
+      for (final e in take) {
+        segments.add(Event(
+          ts: t + e.ts,
+          rssi: e.rssi,
+          handBrakeStatus: e.handBrakeStatus,
+          doorStatus: e.doorStatus,
+          ignitionStatus: e.ignitionStatus,
+          note: tag,
+        ));
+      }
+      t += 5.0;
+    }
+    if (segments.isEmpty) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text("Not enough sampled data to build Mixed sample")),
+      );
+      return;
+    }
+
+    final mixed = TrainingSession(
+      id: "MIXED-${DateTime.now().millisecondsSinceEpoch}",
+      tag: "mixed",
+      device: s.connectedDevice ?? "Unknown",
+      startedAt: DateTime.now().toUtc(),
+      endedAt: DateTime.now().toUtc().add(
+        Duration(milliseconds: (segments.last.ts * 1000).round()),
+      ),
+      events: segments,
+    );
+
+    const toTesting = true;
+
+    final csvPath = await _saveCsvToDisk(mixed, toTesting);
+    final jsonPath = await _saveEiJsonToDisk(mixed, toTesting: toTesting);
+
+    await widget.tryShareFiles(
+      [if (csvPath != null) csvPath, if (jsonPath != null) jsonPath],
+      text: 'BWD mixed_TEST sample (labeled for local review, upload to EI will be unlabeled)',
+      popContext: popContext,
+    );
+
+    const eiApiKey = String.fromEnvironment('EI_PROJECT_API_KEY');
+    if (eiApiKey.isEmpty) {
+      return;
+    }
+
+    // 4) Use the stem when uploading JSON (_uploadEiJson call sites) - Mixed builder upload
+    final canonical = mixed.eiLabel;
+    final stem = eiFileStem(canonical: canonical, toTesting: toTesting);
+
+    final ok = await _uploadEiJson(
+      eiJson: mixed.toEdgeImpulseIngestionJson(),
+      apiKey: eiApiKey,
+      fileName: '$stem.json', // <-- this is what EI will start from
+      label: null,
+      toTesting: toTesting,
+    );
+
+    messenger.showSnackBar(
+      SnackBar(content: Text(ok ? "Mixed uploaded to Edge Impulse Testing ✅" : "Mixed upload failed ❌")),
+    );
+  }
+
+  Future<void> _exportMixedDemoCsv({BuildContext? popContext}) async {
+    final s = widget.state;
+    final messenger = ScaffoldMessenger.of(context);
+
+    final byTag = <String, List<TrainingSession>>{};
+    for (final sess in s.history) {
+      if (sess.tag != "mixed") {
+        byTag.putIfAbsent(sess.tag, () => []).add(sess);
+      }
+    }
+
+    final availableTags = byTag.keys.toList();
+    availableTags.shuffle(_rng);
+
+    if (availableTags.length < 3) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text("Need 3+ different tags in history to build Mixed")),
+      );
+      return;
+    }
+
+    final segments = <Event>[];
+    final tagsPicked = availableTags.take(4);
+    double t = 0.0;
+    for (final tag in tagsPicked) {
+      final tagSessions = byTag[tag]!;
+      final sess = tagSessions[_rng.nextInt(tagSessions.length)].sortedByTimestamp();
+      for (final e in sess.events) {
+        if (e.ts <= 5.0) {
+          segments.add(Event(
+            ts: t + e.ts, rssi: e.rssi,
+            handBrakeStatus: e.handBrakeStatus,
+            doorStatus: e.doorStatus,
+            ignitionStatus: e.ignitionStatus,
+            note: tag,
+          ));
+        }
+      }
+      t += 5.0;
+    }
+
+    if (segments.isEmpty) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text("Not enough sampled data to build Mixed sample")),
+      );
+      return;
+    }
+
+    final mixed = TrainingSession(
+      id: "MIXED-${DateTime.now().millisecondsSinceEpoch}",
+      tag: "mixed",
+      device: s.connectedDevice ?? "Unknown",
+      startedAt: DateTime.now().toUtc(),
+      endedAt: DateTime.now().toUtc().add(Duration(milliseconds: (segments.last.ts * 1000).round())),
+      events: segments,
+    );
+
+    final path = await _saveCsvToDisk(mixed, true);
+    if (path == null) return;
+
+    await widget.tryShareFiles([path], text: 'BWD mixed_TEST (Demo CSV - Label is for local clarity)', popContext: popContext);
+  }
+
   Future<void> _confirmEnd(BuildContext context) async {
     final s = widget.state;
     final snap = TrainingSession(
@@ -1345,35 +1678,51 @@ class _TrainingTabState extends State<_TrainingTab>
       widget.notify();
     }
   }
-  Future<String?> _saveCsvToDisk(TrainingSession session) async {
+
+  Future<String?> _saveCsvToDisk(TrainingSession session, bool toTesting) async {
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final csvData = session.toCsvData();
-      if (csvData.isEmpty) {
+      final isMixed = session.tag == 'mixed';
+      final isMixedTest = isMixed && toTesting;
+      final uploadLabel = labelForUpload(
+          canonical: session.eiLabel, toTesting: toTesting, isMixed: isMixed);
+
+      final rows = List<Map<String, dynamic>>.from(session.toCsvDataForSet(toTesting));
+
+      if (isMixedTest) {
+        for (final r in rows) r['label'] = '';
+      } else {
+        if (uploadLabel != null && uploadLabel.isNotEmpty) {
+          for (final r in rows) r['label'] = uploadLabel;
+        }
+      }
+
+      if (rows.isEmpty) {
         messenger.showSnackBar(const SnackBar(content: Text("No data to export.")));
         return null;
       }
       final headers = const ['timestamp', 'rssi', 'handbrake', 'ignition', 'door', 'label'];
       final buf = StringBuffer()..writeln(headers.join(','));
-      for (final row in csvData) {
+      for (final row in rows) {
         buf.writeln(headers.map((h) => _csvEscape(row[h])).join(','));
       }
       final csvString = buf.toString();
       final ts = DateTime.now().toIso8601String();
-      // Sanitization regex: your filename regex is solid.
       final safeTs = ts.replaceAll(RegExp(r'[<>:"/\\|?*\s]+'), '-');
-      final fname = 'bwd_${session.tag}_$safeTs.csv';
+
+      // 2) Use the stem in your CSV save (replaces fname line in _saveCsvToDisk)
+      final canonical = session.eiLabel; // already canonicalized in your getter
+      final stem = eiFileStem(canonical: canonical, toTesting: toTesting);
+      // Keep timestamp if you still want it locally (EI will append its own bits on upload anyway)
+      final fname = '$stem.csv';
 
       Directory base;
       if (Platform.isAndroid) {
-        // Android 11+ (scoped storage)
         base = (await getExternalStorageDirectory())!;
-        // Create an app subfolder so users can find files easily
         final appDir = Directory('${base.path}/BWD');
         if (!(await appDir.exists())) await appDir.create(recursive: true);
         base = appDir;
       } else {
-        // iOS/macOS
         base = await getApplicationDocumentsDirectory();
       }
 
@@ -1381,28 +1730,26 @@ class _TrainingTabState extends State<_TrainingTab>
       await file.writeAsString(csvString);
 
       messenger.showSnackBar(SnackBar(content: Text("CSV saved to ${file.path}")));
-
       return file.path;
 
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text("CSV export failed: $e")));
+    } catch (e, st) {
+      debugPrint('CSV save to disk failed: $e\n$st');
       return null;
     }
   }
+
   Future<void> _openReviewSheet(BuildContext context, TrainingSession session) async {
     final s = widget.state;
-    bool submitEnabled = true; // Changed to true for immediate enablement
+    bool submitEnabled = true;
     bool isSubmitting = false;
-    bool toTesting = s.eiUploadToTesting; // Initialize with the persisted state
-
+    bool toTesting = (session.tag == 'mixed') ? true : s.eiUploadToTesting;
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
       showDragHandle: true,
       builder: (ctx) {
-        final preview = session.toPreviewJson();
-        final pretty = const JsonEncoder.withIndent(' ').convert(preview);
+        final reviewSheetContext = ctx;
         final messenger = ScaffoldMessenger.of(context);
         final h = MediaQuery.of(ctx).size.height;
         final viewInsets = MediaQuery.of(ctx).viewInsets.bottom;
@@ -1411,25 +1758,33 @@ class _TrainingTabState extends State<_TrainingTab>
           padding: EdgeInsets.only(left: 16, right: 16, bottom: math.max(16.0, viewInsets)),
           child: StatefulBuilder(
             builder: (ctx2, setState) {
+              final isMixed = session.tag == 'mixed';
+              final isMixedTest = isMixed && toTesting;
+
+              final String? uploadLabel = labelForUpload(
+                  canonical: session.eiLabel, toTesting: toTesting, isMixed: isMixed);
+
               Future<void> _submitAndClose() async {
                 setState(() => isSubmitting = true);
                 final success = await widget.submitSession(session);
                 if (!mounted) return;
-
                 if (success) {
                   s.history.insert(0, session);
                   s.discardTraining();
-
-                  // === Auto-upload to Edge Impulse on success ===
                   const eiApiKey = String.fromEnvironment('EI_PROJECT_API_KEY');
                   if (eiApiKey.isNotEmpty) {
                     final eiJson = session.toEdgeImpulseIngestionJson();
+
+                    // 4) Use the stem when uploading JSON (_uploadEiJson call sites)
+                    final canonical = session.eiLabel;
+                    final stem = eiFileStem(canonical: canonical, toTesting: toTesting);
+
                     final ok = await _uploadEiJson(
                       eiJson: eiJson,
                       apiKey: eiApiKey,
-                      fileName: 'bwd_${session.tag}_${DateTime.now().millisecondsSinceEpoch}.json',
-                      label: session.eiLabel,
-                      toTesting: toTesting, // <-- use the toggle value
+                      fileName: '$stem.json', // <-- this is what EI will start from
+                      label: uploadLabel,
+                      toTesting: toTesting,
                     );
                     s.enqueueSnack(ok
                         ? 'Auto-uploaded to Edge Impulse ✅'
@@ -1437,8 +1792,6 @@ class _TrainingTabState extends State<_TrainingTab>
                   } else {
                     s.enqueueSnack('EI_PROJECT_API_KEY not set. Skipping auto-upload.');
                   }
-                  // === end auto-upload ===
-
                   s.enqueueSnack('Session submitted.');
                   Navigator.pop(ctx);
                 } else {
@@ -1452,6 +1805,15 @@ class _TrainingTabState extends State<_TrainingTab>
                 }
                 widget.notify();
               }
+              final byTag = <String, List<TrainingSession>>{};
+              for (final sess in s.history) {
+                if (sess.tag != "mixed") {
+                  byTag.putIfAbsent(sess.tag, () => []).add(sess);
+                }
+              }
+              final availableTags = byTag.keys.toList();
+              final canBuildMixed = availableTags.length >= 3;
+
               return FractionallySizedBox(
                 heightFactor: 0.92,
                 child: Column(
@@ -1470,14 +1832,24 @@ class _TrainingTabState extends State<_TrainingTab>
                           Text("Session Summary", style: Theme.of(ctx2).textTheme.titleMedium),
                           const SizedBox(height: 8),
                           _kv("Device", session.device),
-                          // Show both UI tag and API tag to prevent confusion
                           _kv("Tag (UI)", session.tag),
                           _kv("Tag (API)", _apiTagFor(session.tag)),
+                          _kv("EI Label", uploadLabel ?? "UNLABELED (Mixed TEST)"),
                           _kv("Events", "${session.count}"),
                           _kv("Duration", "${session.durationSec.toStringAsFixed(1)} s"),
                           _kv("RSSI", "avg ${session.avgRssi.toStringAsFixed(1)} dBm (min ${session.minRssi.toStringAsFixed(1)} / max ${session.maxRssi.toStringAsFixed(1)})"),
                           const SizedBox(height: 12),
-                          Text("JSON Preview", style: Theme.of(ctx2).textTheme.titleMedium),
+                          Row(
+                            children: [
+                              Text("JSON Preview", style: Theme.of(ctx2).textTheme.titleMedium),
+                              const SizedBox(width: 8),
+                              Chip(
+                                visualDensity: const VisualDensity(horizontal: 0, vertical: -4),
+                                label: Text('500 ms Cadence Enforced', style: Theme.of(ctx2).textTheme.labelSmall),
+                                backgroundColor: Theme.of(ctx2).colorScheme.primary.withOpacity(0.1),
+                              ),
+                            ],
+                          ),
                           const SizedBox(height: 8),
                           Container(
                             constraints: BoxConstraints(
@@ -1491,21 +1863,18 @@ class _TrainingTabState extends State<_TrainingTab>
                             ),
                             child: SingleChildScrollView(
                               child: Text(
-                                // MODIFIED: If Demo Mode, show the correct EI JSON format.
-                                kDemoMode
-                                    ? const JsonEncoder.withIndent(' ').convert(session.toEdgeImpulseIngestionJson())
-                                    : pretty,
+                                const JsonEncoder.withIndent(' ').convert(session.toEdgeImpulseIngestionJson()),
                                 style: const TextStyle(fontFamily: 'monospace'),
                               ),
                             ),
                           ),
                           const SizedBox(height: 12),
                           SwitchListTile(
-                            title: const Text('Upload to Testing set'),
+                            title: Text(isMixed ? 'Upload to Testing set (Required for Mixed)' : 'Upload to Testing set'),
                             value: toTesting,
-                            onChanged: isSubmitting ? null : (v) => setState(() {
+                            onChanged: isSubmitting || isMixed ? null : (v) => setState(() {
                               toTesting = v;
-                              s.eiUploadToTesting = v; // Persist the value
+                              s.eiUploadToTesting = v;
                             }),
                             secondary: const Icon(Icons.psychology_outlined),
                           ),
@@ -1518,7 +1887,8 @@ class _TrainingTabState extends State<_TrainingTab>
                         padding: const EdgeInsets.only(top: 8, bottom: 8),
                         child: LayoutBuilder(
                           builder: (ctx3, c) {
-                            final narrow = c.maxWidth < 380; // small phones
+                            final narrow = c.maxWidth < 380;
+
                             return Column(
                               crossAxisAlignment: CrossAxisAlignment.stretch,
                               children: [
@@ -1529,47 +1899,21 @@ class _TrainingTabState extends State<_TrainingTab>
                                   children: [
                                     OutlinedButton.icon(
                                       icon: const Icon(Icons.copy_all),
-                                      label: const Text("Copy JSON"),
+                                      label: const Text("Copy EI JSON"),
                                       onPressed: isSubmitting ? null : () async {
-                                        // MODIFIED: In Demo Mode, copy the EI JSON instead of the preview JSON.
-                                        final content = kDemoMode
-                                            ? const JsonEncoder.withIndent(' ').convert(session.toEdgeImpulseIngestionJson())
-                                            : pretty;
+                                        final content = const JsonEncoder.withIndent(' ').convert(session.toEdgeImpulseIngestionJson());
                                         await Clipboard.setData(ClipboardData(text: content));
                                         messenger.clearSnackBars();
-                                        messenger.showSnackBar(const SnackBar(content: Text("JSON copied")));
+                                        messenger.showSnackBar(const SnackBar(content: Text("EI JSON copied")));
                                       },
                                     ),
                                     OutlinedButton.icon(
                                       icon: const Icon(Icons.file_download),
-                                      label: const Text("Export EI JSON"),
+                                      label: const Text("Share EI JSON"),
                                       onPressed: isSubmitting ? null : () async {
-                                        final messenger = ScaffoldMessenger.of(context);
-                                        try {
-                                          final eiJson = session.toEdgeImpulseIngestionJson();
-                                          final jsonString = const JsonEncoder.withIndent(' ').convert(eiJson);
-
-                                          final ts = DateTime.now().toIso8601String();
-                                          final safeTs = ts.replaceAll(RegExp(r'[<>:"/\\|?*\s]+'), '-');
-                                          final fname = 'bwd_${session.tag}_$safeTs.json';
-
-                                          Directory base;
-                                          if (Platform.isAndroid) {
-                                            base = (await getExternalStorageDirectory())!;
-                                            final appDir = Directory('${base.path}/BWD');
-                                            if (!(await appDir.exists())) await appDir.create(recursive: true);
-                                            base = appDir;
-                                          } else {
-                                            base = await getApplicationDocumentsDirectory();
-                                          }
-                                          final file = File('${base.path}/$fname');
-                                          await file.writeAsString(jsonString);
-
-                                          messenger.showSnackBar(SnackBar(content: Text("JSON saved to ${file.path}")));
-                                          await Share.shareXFiles([XFile(file.path)], text: 'Edge Impulse JSON export');
-
-                                        } catch (e) {
-                                          messenger.showSnackBar(SnackBar(content: Text("JSON export failed: $e")));
+                                        final path = await _saveEiJsonToDisk(session, toTesting: toTesting);
+                                        if (path != null) {
+                                          await widget.tryShareFiles([path], text: 'Edge Impulse JSON export', popContext: reviewSheetContext);
                                         }
                                       },
                                     ),
@@ -1577,9 +1921,9 @@ class _TrainingTabState extends State<_TrainingTab>
                                       icon: const Icon(Icons.ios_share),
                                       label: const Text("Share CSV"),
                                       onPressed: () async {
-                                        final path = await _saveCsvToDisk(session);
+                                        final path = await _saveCsvToDisk(session, toTesting);
                                         if (path != null) {
-                                          await Share.shareXFiles([XFile(path)], text: 'BWD session CSV');
+                                          await widget.tryShareFiles([path], text: 'BWD session CSV', popContext: reviewSheetContext);
                                         }
                                       },
                                     ),
@@ -1593,15 +1937,20 @@ class _TrainingTabState extends State<_TrainingTab>
                                           messenger.showSnackBar(const SnackBar(content: Text("Missing EI API key")));
                                           return;
                                         }
-
                                         final eiJson = session.toEdgeImpulseIngestionJson();
+
+                                        // 4) Use the stem when uploading JSON (_uploadEiJson call sites)
+                                        final canonical = session.eiLabel;
+                                        final stem = eiFileStem(canonical: canonical, toTesting: toTesting);
+
                                         final ok = await _uploadEiJson(
                                           eiJson: eiJson,
                                           apiKey: eiApiKey,
-                                          fileName: 'bwd_${session.tag}_${DateTime.now().millisecondsSinceEpoch}.json',
-                                          label: session.eiLabel,
+                                          fileName: '$stem.json', // <-- this is what EI will start from
+                                          label: uploadLabel,
                                           toTesting: toTesting,
                                         );
+
                                         messenger.clearSnackBars();
                                         messenger.showSnackBar(SnackBar(
                                           content: Text(ok ? "Uploaded to Edge Impulse ✅" : "Upload failed ❌"),
@@ -1618,22 +1967,77 @@ class _TrainingTabState extends State<_TrainingTab>
                                           messenger.showSnackBar(const SnackBar(content: Text("Missing EI API key")));
                                           return;
                                         }
+                                        try {
+                                          final rows = List<Map<String, dynamic>>.from(session.toCsvDataForSet(toTesting));
 
-                                        final path = await _saveCsvToDisk(session);
-                                        if (path == null) {
-                                          return;
+                                          if (isMixedTest) {
+                                            for (final r in rows) r['label'] = '';
+                                          } else {
+                                            if (uploadLabel != null && uploadLabel.isNotEmpty) {
+                                              for (final r in rows) r['label'] = uploadLabel;
+                                            }
+                                          }
+
+                                          if (rows.isEmpty) {
+                                            messenger.showSnackBar(const SnackBar(content: Text("No data to upload.")));
+                                            return;
+                                          }
+                                          final headers = const ['timestamp', 'rssi', 'handbrake', 'ignition', 'door', 'label'];
+                                          final buf = StringBuffer()..writeln(headers.join(','));
+                                          for (final row in rows) {
+                                            buf.writeln(headers.map((h) => _csvEscape(row[h])).join(','));
+                                          }
+                                          final csvString = buf.toString();
+
+                                          // The code below is for creating a temporary file for upload.
+                                          // It needs to follow the new naming convention to be correctly interpreted by EI.
+                                          final canonical = session.eiLabel;
+                                          final stem = eiFileStem(canonical: canonical, toTesting: toTesting);
+                                          final fname = '$stem.csv';
+
+                                          Directory base;
+                                          if (Platform.isAndroid) {
+                                            base = (await getExternalStorageDirectory())!;
+                                            final appDir = Directory('${base.path}/BWD');
+                                            if (!(await appDir.exists())) await appDir.create(recursive: true);
+                                            base = appDir;
+                                          } else {
+                                            base = await getApplicationDocumentsDirectory();
+                                          }
+                                          final file = File('${base.path}/$fname');
+                                          await file.writeAsString(buf.toString());
+
+                                          final ok = await _uploadCsvToEdgeImpulse(
+                                            csvPath: file.path,
+                                            apiKey: eiApiKey,
+                                            label: uploadLabel,
+                                            toTesting: toTesting,
+                                          );
+                                          messenger.clearSnackBars();
+                                          messenger.showSnackBar(
+                                            SnackBar(content: Text(ok ? "Uploaded to Edge Impulse ✅" : "Upload failed ❌")),
+                                          );
+                                          file.delete().catchError((_) {});
+                                        } catch (e) {
+                                          messenger.showSnackBar(SnackBar(content: Text("CSV upload failed: $e")));
                                         }
-                                        final ok = await _uploadCsvToEdgeImpulse(
-                                          csvPath: path,
-                                          apiKey: eiApiKey,
-                                          label: session.eiLabel,
-                                          toTesting: toTesting,
-                                        );
-                                        messenger.clearSnackBars();
-                                        messenger.showSnackBar(
-                                          SnackBar(content: Text(ok ? "Uploaded to Edge Impulse ✅" : "Upload failed ❌")),
-                                        );
                                       },
+                                    ),
+                                    Tooltip(
+                                      message: canBuildMixed ? "Build a mixed-tag sample from history and upload for testing (unlabeled)." : "Need 3+ different tags in history to build Mixed sample.",
+                                      child: OutlinedButton.icon(
+                                        icon: const Icon(Icons.shuffle),
+                                        label: const Text("Build Mixed (TEST)"),
+                                        onPressed: canBuildMixed && !isSubmitting ? () => _buildAndUploadMixedTestSample(popContext: reviewSheetContext) : null,
+                                      ),
+                                    ),
+                                    Tooltip(
+                                      message: canBuildMixed ? "Generate and share a Mixed CSV file (includes a label for local clarity)." : "Need 3+ different tags in history to build Mixed sample.",
+                                      child: OutlinedButton.icon(
+                                        icon: const Icon(Icons.description_outlined),
+                                        label: const Text("Share Mixed CSV (Demo)"),
+                                        onPressed: canBuildMixed && !isSubmitting ? () => _exportMixedDemoCsv(popContext: reviewSheetContext) : null,
+                                      ),
                                     ),
                                     SizedBox(
                                       width: narrow ? double.infinity : null,
@@ -1660,6 +2064,7 @@ class _TrainingTabState extends State<_TrainingTab>
       },
     );
   }
+
   @override
   Widget build(BuildContext context) {
     final s = widget.state;
@@ -1854,13 +2259,16 @@ class _TrainingTabState extends State<_TrainingTab>
     );
   }
 }
+
 const int RSSI_GOOD = -50;
 const int RSSI_OK = -70;
+
 Color _getRssiColor(int rssi) {
   if (rssi >= RSSI_GOOD) return Colors.green;
   if (rssi >= RSSI_OK) return Colors.orange;
   return Colors.red;
 }
+
 Widget _rssiChip(int? rssi) {
   final has = rssi != null;
   final color = has ? _getRssiColor(rssi!) : Colors.grey;
@@ -1887,6 +2295,7 @@ Widget _rssiChip(int? rssi) {
     ),
   );
 }
+
 Widget _kv(String k, String v) => Padding(
   padding: const EdgeInsets.symmetric(vertical: 2),
   child: Row(
@@ -1914,7 +2323,6 @@ class _LiveEventList extends StatefulWidget {
 class _LiveEventListState extends State<_LiveEventList> {
   final _scrollController = ScrollController();
   bool get _atLiveEdge => !_scrollController.hasClients ? true : _scrollController.offset <= 24.0;
-
   @override
   void didUpdateWidget(covariant _LiveEventList oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -1924,11 +2332,13 @@ class _LiveEventListState extends State<_LiveEventList> {
       }
     });
   }
+
   @override
   void dispose() {
     _scrollController.dispose();
     super.dispose();
   }
+
   @override
   Widget build(BuildContext context) {
     final s = widget.state;
@@ -1941,19 +2351,16 @@ class _LiveEventListState extends State<_LiveEventList> {
       );
     }
     final total = s.buffer.length;
-    final start = math.max(0, total - 200); // Show last 200 events
+    final start = math.max(0, total - 200);
     final view = s.buffer.sublist(start);
-
     return ListView.builder(
       controller: _scrollController,
-      reverse: true, // Newest items stick to the bottom/start of the list
+      reverse: true,
       physics: const BouncingScrollPhysics(),
       itemCount: view.length,
       itemBuilder: (_, idx) {
-        // Access the item directly from the sublist
         final e = view[idx];
         final rssiStatus = e.rssi >= RSSI_GOOD ? 'good' : (e.rssi >= RSSI_OK ? 'fair' : 'poor');
-
         return Semantics(
           label: 'ts ${e.ts}s, RSSI ${e.rssi} dBm $rssiStatus, handbrake ${e.handBrakeStatus == 1 ? 'engaged' : 'disengaged'}',
           child: Column(
@@ -2007,6 +2414,7 @@ class _LiveEventListState extends State<_LiveEventList> {
     );
   }
 }
+
 class _HistoryTab extends StatefulWidget {
   final _UiState state;
   final VoidCallback notify;
@@ -2014,6 +2422,7 @@ class _HistoryTab extends StatefulWidget {
   @override
   State<_HistoryTab> createState() => _HistoryTabState();
 }
+
 class _HistoryTabState extends State<_HistoryTab> {
   int _page = 1;
   static const _per = 5;
